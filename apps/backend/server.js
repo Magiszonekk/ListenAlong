@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') });
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -15,7 +15,7 @@ process.on('exit', () => { try { xvfb.kill(); } catch (_) {} });
 
 const app = express();
 
-const LOGS_DIR = path.join(__dirname, 'logs');
+const LOGS_DIR = path.join(__dirname, '..', '..', 'logs');
 
 let currentLogDate = null;
 let logStream = null;
@@ -51,7 +51,7 @@ function pruneClients() {
 }
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, '..', 'frontend', 'dist')));
 
 // Heartbeat — update lastSeen for any request carrying X-Client-Id
 app.use((req, res, next) => {
@@ -84,7 +84,7 @@ app.get('/callback', (req, res) => {
 app.use('/spotify', require('./routes/spotify'));
 app.use('/youtube', require('./routes/youtube'));
 
-const PORT = 3004;
+const PORT = process.env.PORT || 3004;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running at http://0.0.0.0:${PORT}`);
 });

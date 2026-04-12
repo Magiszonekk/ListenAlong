@@ -28,7 +28,11 @@ const ytmusicReady = ytmusic.initialize();
 
 let trackCache = {};
 try {
-  trackCache = JSON.parse(fs.readFileSync(TRACK_CACHE_FILE, 'utf8'));
+  const raw = JSON.parse(fs.readFileSync(TRACK_CACHE_FILE, 'utf8'));
+  // Migrate old format (string videoId) to new format (object)
+  for (const [id, val] of Object.entries(raw)) {
+    trackCache[id] = typeof val === 'string' ? { videoId: val } : val;
+  }
   console.log(`[cache] loaded ${Object.keys(trackCache).length} entries from cache.json`);
 } catch (_) {}
 
@@ -175,7 +179,7 @@ router.get('/search', async (req, res) => {
   // Persistent cache hit — no ytmusic-api call needed
   if (track_id && trackCache[track_id]) {
     console.log(`[search] cache hit for ${track_id}`);
-    return res.json({ videoId: trackCache[track_id] });
+    return res.json({ videoId: trackCache[track_id].videoId });
   }
 
   const targetMs = parseInt(duration_ms, 10);
@@ -195,7 +199,7 @@ router.get('/search', async (req, res) => {
   const videoId = match ? match.videoId : null;
 
   if (videoId && track_id) {
-    trackCache[track_id] = videoId;
+    trackCache[track_id] = { videoId, track, artist, ytTitle: match.name };
     saveTrackCache();
   }
 
