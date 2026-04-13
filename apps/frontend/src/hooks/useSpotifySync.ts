@@ -243,9 +243,14 @@ export function useSpotifySync() {
     log(`[debug] found videoId=${ytData.videoId}, loading audio...`);
     setStatus('Loading audio...');
 
+    const expectedTrackId = data.track_id;
     const newAudio = new Audio(`/youtube/audio/${ytData.videoId}`);
     newAudio.preload = 'auto';
     newAudio.addEventListener('canplay', () => {
+      if (currentTrackIdRef.current !== expectedTrackId) {
+        log(`[debug] canplay stale for ${ytData.videoId} — skipping (expected ${expectedTrackId}, now ${currentTrackIdRef.current})`);
+        return;
+      }
       log(`[debug] canplay fired for ${ytData.videoId}, seeking then swapping`);
       seekThenSwap(newAudio, spotifySec);
     }, { once: true });
