@@ -223,18 +223,28 @@ router.get('/search', async (req, res) => {
       // Cache valid — current videoId not on blacklist
       if (!blacklistedIds.has(cached.videoId)) {
         console.log(`[search] cache hit for ${track_id}`);
-        // Backfill ytTitle in background if missing
-        if (!cached.ytTitle) {
-          ytmusicReady
-            .then(() => ytmusic.searchSongs(`${track} ${artist}`))
-            .then((results) => {
-              const match = results.find((s) => s.videoId === cached.videoId);
-              if (match?.name) {
-                console.log(`[search] backfilling ytTitle for ${track_id}: ${match.name}`);
-                return prisma.track.update({ where: { id: track_id }, data: { ytTitle: match.name } });
-              }
-            })
-            .catch(() => {});
+        // Backfill missing fields in background
+        if (!cached.ytTitle || !cached.track || !cached.artist) {
+          const metaUpdate = {};
+          if (!cached.track && track) metaUpdate.track = track;
+          if (!cached.artist && artist) metaUpdate.artist = artist;
+
+          if (!cached.ytTitle) {
+            ytmusicReady
+              .then(() => ytmusic.searchSongs(`${track} ${artist}`))
+              .then((results) => {
+                const match = results.find((s) => s.videoId === cached.videoId);
+                if (match?.name) metaUpdate.ytTitle = match.name;
+                if (Object.keys(metaUpdate).length) {
+                  console.log(`[search] backfilling [${Object.keys(metaUpdate).join(', ')}] for ${track_id}`);
+                  return prisma.track.update({ where: { id: track_id }, data: metaUpdate });
+                }
+              })
+              .catch(() => {});
+          } else if (Object.keys(metaUpdate).length) {
+            console.log(`[search] backfilling [${Object.keys(metaUpdate).join(', ')}] for ${track_id}`);
+            prisma.track.update({ where: { id: track_id }, data: metaUpdate }).catch(() => {});
+          }
         }
         return res.json({ videoId: cached.videoId, allSourcesTried: false });
       }

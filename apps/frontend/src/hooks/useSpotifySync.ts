@@ -67,6 +67,8 @@ export function useSpotifySync() {
   const listeningPausedRef = useRef(false);
   const programmaticPauseRef = useRef(false);
   const wasSpotifyPlayingRef = useRef<boolean | null>(null);
+  const pendingTrackIdRef = useRef<string | null>(null);
+  const prevProgressRef = useRef<number | null>(null);
 
   function pauseProgrammatic(audio: HTMLAudioElement | null | undefined) {
     if (!audio) return;
@@ -123,7 +125,7 @@ export function useSpotifySync() {
     el.className = audio.className;
     audio.parentNode!.replaceChild(el, audio);
     // Update ref — replaceChild swapped the node in DOM; update our ref manually
-    (audioRef as React.MutableRefObject<HTMLAudioElement>).current = el;
+    (audioRef as React.RefObject<HTMLAudioElement>).current = el;
     attachAudioListeners(el);
     if (!listeningPausedRef.current) {
       el.play().catch((err: Error) => {
@@ -196,9 +198,15 @@ export function useSpotifySync() {
         newPa.preload = 'auto';
         prefetchAudioRef.current = newPa;
       } else {
+        const expectedTrackId = data.track_id;
+        const expectedVideoId = prefetchVideoIdRef.current;
         setStatus('Buffering...');
         pa.addEventListener('canplay', () => {
-          log(`[debug] prefetchAudio canplay fired, swapping to ${prefetchVideoIdRef.current}`);
+          if (currentTrackIdRef.current !== expectedTrackId || prefetchVideoIdRef.current !== expectedVideoId) {
+            log(`[debug] prefetchAudio canplay stale — skipping (expected ${expectedVideoId}/${expectedTrackId}, now ${prefetchVideoIdRef.current}/${currentTrackIdRef.current})`);
+            return;
+          }
+          log(`[debug] prefetchAudio canplay fired, swapping to ${expectedVideoId}`);
           seekThenSwap(pa, spotifySec);
           const newPa = new Audio();
           newPa.preload = 'auto';
@@ -287,7 +295,19 @@ export function useSpotifySync() {
     setIsPlaying(data.is_playing);
     const spotifySec = data.progress_ms / 1000;
 
+    const isProgressJump = prevProgressRef.current !== null &&
+      data.is_playing &&
+      data.progress_ms < prevProgressRef.current - 5000;
+    prevProgressRef.current = data.progress_ms;
+
     if (data.track_id !== currentTrackIdRef.current) {
+      const isFirstTrack = currentTrackIdRef.current === null;
+      if (!isFirstTrack && !isProgressJump && pendingTrackIdRef.current !== data.track_id) {
+        pendingTrackIdRef.current = data.track_id;
+        log(`[debug] pending track change: ${data.track_id} (${data.track}) — awaiting confirmation`);
+        return;
+      }
+      pendingTrackIdRef.current = null;
       log(`\n--- ${data.track} – ${data.artist} ---`);
       log(`[debug] track changed: ${currentTrackIdRef.current} → ${data.track_id} (${data.track})`);
       currentTrackIdRef.current = data.track_id;
@@ -308,21 +328,27 @@ export function useSpotifySync() {
           }
         })
         .catch(() => {});
-    } else if (currentVideoIdRef.current) {
-      if (++pollCountRef.current % 3 === 0) pollQueue();
-      const audio = audioRef.current;
-      if (audio) {
-        if (audio.ended) {
-          setStatus('Czekam na następny utwór...');
-        } else {
-          const drift = Math.abs(audio.currentTime - spotifySec);
-          if (drift > 2) {
-            setStatus(`Correcting drift (${drift.toFixed(1)}s)...`);
-            audio.currentTime = spotifySec;
+    } else {
+      if (pendingTrackIdRef.current !== null) {
+        log(`[debug] track_id reverted to current — glitch detected, resetting pending`);
+      }
+      pendingTrackIdRef.current = null;
+      if (currentVideoIdRef.current) {
+        if (++pollCountRef.current % 3 === 0) pollQueue();
+        const audio = audioRef.current;
+        if (audio) {
+          if (audio.ended) {
+            setStatus('Czekam na następny utwór...');
           } else {
-            setStatus('In sync.');
+            const drift = Math.abs(audio.currentTime - spotifySec);
+            if (drift > 2) {
+              setStatus(`Correcting drift (${drift.toFixed(1)}s)...`);
+              audio.currentTime = spotifySec;
+            } else {
+              setStatus('In sync.');
+            }
+            if (audio.paused && !listeningPausedRef.current) audio.play().catch(() => {});
           }
-          if (audio.paused && !listeningPausedRef.current) audio.play().catch(() => {});
         }
       }
     }

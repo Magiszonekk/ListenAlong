@@ -31,7 +31,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white flex flex-col items-center justify-center gap-4 p-6">
-      <h1 className="text-2xl font-bold text-[#1db954]">Spotify → YouTube Sync</h1>
+      <h1 className="text-2xl font-bold text-[#1db954]">ListenAlong</h1>
 
       {listenersText && (
         <p className="text-xs text-neutral-500">{listenersText}</p>
