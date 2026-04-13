@@ -64,7 +64,7 @@ app.use((req, res, next) => {
 // GET /clients — returns active listener count
 app.get('/clients', (req, res) => {
   pruneClients();
-  res.json({ count: activeClients.size });
+  res.json({ count: activeClients.size, clientIds: [...activeClients.keys()] });
 });
 
 // POST /log — frontend sends debug logs here

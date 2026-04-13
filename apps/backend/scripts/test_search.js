@@ -10,9 +10,10 @@
 const { execFile } = require('child_process');
 const path = require('path');
 const YTMusic = require('ytmusic-api');
+const { search: searchConfig } = require('@listenalong/config');
 
 const NOISE_RE = /\b(instrumental|karaoke|off[\s-]?vocal|backing[\s-]?track|inst\.?|nightcore|nighcore|cover|ai\s+cover|slowed|reverb|sped[\s-]?up|speed[\s-]?up|(?:english|spanish|french|portuguese|german|italian|dutch|korean|chinese)\s+(?:ver(?:sion)?\.?|dub)|translat(?:ion|ed))\b|[\[(（](?:inst|english)[\]）)]|インスト|カラオケ|オフボーカル|\bMR\b/i;
-const ODESLI_BONUS_MS = 20000;
+const ODESLI_BONUS_MS = searchConfig.odesliBonus;
 
 const YT_DLP = process.env.YT_DLP_PATH || '/usr/local/bin/yt-dlp';
 const COOKIES_TMP = path.join(__dirname, '..', 'cookies_tmp.txt');
@@ -79,7 +80,7 @@ function searchYouTube(t, a) {
       ['--no-download', '--print', '%(id)s\t%(duration)s\t%(title)s',
        '--cookies', COOKIES_TMP,
        '--js-runtimes', `node:${NODE_BIN}`,
-       `ytsearch5:${t} ${a}`],
+       `ytsearch${searchConfig.ytSearchCount}:${t} ${a}`],
       { timeout: 12000 },
       (err, stdout) => {
         if (err && !stdout) { resolve([]); return; }

@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button';
 import { AudioPlayer } from '@/components/AudioPlayer';
 import { NowPlaying } from '@/components/NowPlaying';
 import { SyncStatus } from '@/components/SyncStatus';
-import { clientShort, useSpotifySync } from '@/hooks/useSpotifySync';
+import { clientId, clientShort, useSpotifySync } from '@/hooks/useSpotifySync';
 
 export default function App() {
   const {
@@ -15,6 +15,7 @@ export default function App() {
     isPlaying,
     status,
     listenerCount,
+    clientIds,
     audioRef,
     trackNotIdeal,
     trackBugged,
@@ -34,7 +35,18 @@ export default function App() {
       <h1 className="text-2xl font-bold text-[#1db954]">ListenAlong</h1>
 
       {listenersText && (
-        <p className="text-xs text-neutral-500">{listenersText}</p>
+        <div className="relative group cursor-default">
+          <p className="text-xs text-neutral-500">{listenersText}</p>
+          {clientIds.length > 0 && (
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover:flex flex-col bg-neutral-900 border border-neutral-700 text-xs rounded px-2 py-1 whitespace-nowrap z-10">
+              {clientIds.map(id => (
+                id === clientId
+                  ? <span key={id} className="font-bold text-white">{id.slice(0, 6)} (ty)</span>
+                  : <span key={id} className="text-neutral-400">{id.slice(0, 6)}</span>
+              ))}
+            </div>
+          )}
+        </div>
       )}
       <p className="text-[11px] text-neutral-700 font-mono">ID: {clientShort}</p>
 

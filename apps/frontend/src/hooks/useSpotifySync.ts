@@ -1,18 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import config from '@listenalong/config';
 
-// Per-tab client ID (persisted in sessionStorage for heartbeat tracking)
+// Client ID persisted in localStorage — same ID across tabs and sessions
 function getClientId(): string {
-  let id = sessionStorage.getItem('clientId');
+  let id = localStorage.getItem('clientId');
   if (!id) {
     id = crypto.randomUUID();
-    sessionStorage.setItem('clientId', id);
+    localStorage.setItem('clientId', id);
   }
   return id;
 }
 
-const clientId = getClientId();
+export const clientId = getClientId();
 export const clientShort = clientId.slice(0, 6);
+
+function applyStoredVolume(el: HTMLAudioElement) {
+  const v = parseFloat(localStorage.getItem('audioVolume') ?? '1');
+  el.volume = Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 1;
+  el.muted = localStorage.getItem('audioMuted') === 'true';
+}
 
 // Wrap fetch to always send X-Client-Id for same-origin requests
 const _fetch = window.fetch.bind(window);
@@ -67,6 +73,7 @@ export function useSpotifySync() {
   const [isListeningPaused, setIsListeningPaused] = useState(false);
   const listeningPausedRef = useRef(false);
   const programmaticPauseRef = useRef(false);
+  const spotifyPausedRef = useRef(false);
   const wasSpotifyPlayingRef = useRef<boolean | null>(null);
   const pendingTrackIdRef = useRef<string | null>(null);
   const prevProgressRef = useRef<number | null>(null);
@@ -94,8 +101,13 @@ export function useSpotifySync() {
         logEvent('resume', currentTrackIdRef.current);
       }
     });
+    el.addEventListener('volumechange', () => {
+      localStorage.setItem('audioVolume', String(el.volume));
+      localStorage.setItem('audioMuted', String(el.muted));
+    });
   }
   const [listenerCount, setListenerCount] = useState<number | null>(null);
+  const [clientIds, setClientIds] = useState<string[]>([]);
   const [trackNotIdeal, setTrackNotIdeal] = useState(false);
   const [trackBugged, setTrackBugged] = useState(false);
   const [trackAllSourcesTried, setTrackAllSourcesTried] = useState(false);
@@ -128,6 +140,7 @@ export function useSpotifySync() {
     // Update ref — replaceChild swapped the node in DOM; update our ref manually
     (audioRef as React.RefObject<HTMLAudioElement>).current = el;
     attachAudioListeners(el);
+    applyStoredVolume(el);
     if (!listeningPausedRef.current) {
       el.play().catch((err: Error) => {
         log(`[error] play() rejected: ${err.message}`);
@@ -290,11 +303,19 @@ export function useSpotifySync() {
       wasSpotifyPlayingRef.current = false;
       setStatus('Spotify is paused or nothing is playing.');
       pauseProgrammatic(audioRef.current);
+      spotifyPausedRef.current = true;
       setIsPlaying(false);
       return;
     }
 
-    if (wasSpotifyPlayingRef.current === false) logEvent('spotify_play', currentTrackIdRef.current);
+    if (wasSpotifyPlayingRef.current === false) {
+      logEvent('spotify_play', currentTrackIdRef.current);
+      if (spotifyPausedRef.current) {
+        spotifyPausedRef.current = false;
+        listeningPausedRef.current = false;
+        setIsListeningPaused(false);
+      }
+    }
     wasSpotifyPlayingRef.current = true;
     setTrackName(data.track);
     setArtistName(data.artist);
@@ -365,6 +386,7 @@ export function useSpotifySync() {
       const res = await fetch('/clients');
       const data = await res.json();
       setListenerCount(data.count);
+      setClientIds(data.clientIds ?? []);
     } catch (_) {}
   }, []);
 
@@ -422,7 +444,10 @@ export function useSpotifySync() {
 
   useEffect(() => {
     if (!started) return;
-    if (audioRef.current) attachAudioListeners(audioRef.current);
+    if (audioRef.current) {
+      attachAudioListeners(audioRef.current);
+      applyStoredVolume(audioRef.current);
+    }
     poll();
     const pollInterval = setInterval(poll, config.polling.spotifyMs);
     updateListeners();
@@ -442,6 +467,7 @@ export function useSpotifySync() {
     isPlaying,
     status,
     listenerCount,
+    clientIds,
     audioRef,
     isListeningPaused,
     trackNotIdeal,

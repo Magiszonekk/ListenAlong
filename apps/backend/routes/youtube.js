@@ -183,7 +183,7 @@ async function searchYouTube(track, artist) {
         '--no-download', '--print', '%(id)s\t%(duration)s\t%(title)s',
         '--cookies', COOKIES_TMP,
         '--js-runtimes', `node:${process.env.NODE_PATH || '/home/ubuntu/.nvm/versions/node/v22.22.0/bin/node'}`,
-        `ytsearch5:${track} ${artist}`,
+        `ytsearch${searchConfig.ytSearchCount}:${track} ${artist}`,
       ],
       { timeout: 12000 },
       (err, stdout) => {
