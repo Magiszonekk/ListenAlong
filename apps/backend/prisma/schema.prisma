@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:../jjp_music.db"
+}
+
+model Track {
+  id        String   @id
+  videoId   String
+  track     String
+  artist    String
+  ytTitle   String?
+  source          String   @default("search")
+  not_ideal       Boolean  @default(false)
+  bugged          Boolean  @default(false)
+  allSourcesTried Boolean  @default(false)
+  searchMode      String   @default("default")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  plays           Play[]
+  blacklist       VideoBlacklist[]
+}
+
+model VideoBlacklist {
+  id        Int      @id @default(autoincrement())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id])
+  videoId   String
+  reason    String
+  createdAt DateTime @default(now())
+
+  @@unique([trackId, videoId])
+}
+
+model Play {
+  id        Int      @id @default(autoincrement())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id])
+  clientId  String
+  playedAt  DateTime @default(now())
+}
+
+model AuthEvent {
+  id        Int      @id @default(autoincrement())
+  ip        String
+  userAgent String?
+  action    String
+  createdAt DateTime @default(now())
+}
+
+model UserEvent {
+  id        Int      @id @default(autoincrement())
+  clientId  String
+  trackId   String?
+  action    String
+  ip        String?
+  createdAt DateTime @default(now())
+}

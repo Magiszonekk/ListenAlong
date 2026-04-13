@@ -32,6 +32,14 @@ export function log(msg: string) {
   }).catch(() => {});
 }
 
+function logEvent(action: string, trackId?: string | null) {
+  fetch('/events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, trackId: trackId ?? null }),
+  }).catch(() => {});
+}
+
 interface NowPlaying {
   track: string;
   artist: string;
@@ -55,7 +63,41 @@ export function useSpotifySync() {
   const [artistName, setArtistName] = useState('—');
   const [isPlaying, setIsPlaying] = useState(false);
   const [status, setStatus] = useState('Kliknij Start aby zsynchronizować.');
+  const [isListeningPaused, setIsListeningPaused] = useState(false);
+  const listeningPausedRef = useRef(false);
+  const programmaticPauseRef = useRef(false);
+  const wasSpotifyPlayingRef = useRef<boolean | null>(null);
+
+  function pauseProgrammatic(audio: HTMLAudioElement | null | undefined) {
+    if (!audio) return;
+    programmaticPauseRef.current = true;
+    audio.pause();
+  }
+
+  function attachAudioListeners(el: HTMLAudioElement) {
+    el.addEventListener('pause', () => {
+      if (programmaticPauseRef.current) { programmaticPauseRef.current = false; return; }
+      if (el.ended) return; // natural end, not user action
+      listeningPausedRef.current = true;
+      setIsListeningPaused(true);
+      setStatus('Słuchanie wstrzymane.');
+      logEvent('pause', currentTrackIdRef.current);
+    });
+    el.addEventListener('play', () => {
+      if (listeningPausedRef.current) {
+        listeningPausedRef.current = false;
+        setIsListeningPaused(false);
+        setStatus('In sync.');
+        logEvent('resume', currentTrackIdRef.current);
+      }
+    });
+  }
   const [listenerCount, setListenerCount] = useState<number | null>(null);
+  const [trackNotIdeal, setTrackNotIdeal] = useState(false);
+  const [trackBugged, setTrackBugged] = useState(false);
+  const [trackAllSourcesTried, setTrackAllSourcesTried] = useState(false);
+  const [trackSource, setTrackSource] = useState('');
+  const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
 
   // Audio element is managed as a mutable ref — we swap it in the DOM directly
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -75,17 +117,20 @@ export function useSpotifySync() {
 
   function swapIntoPlayer(el: HTMLAudioElement) {
     const audio = audioRef.current!;
-    audio.pause();
+    pauseProgrammatic(audio);
     el.id = 'audio-player';
     el.controls = true;
     el.className = audio.className;
     audio.parentNode!.replaceChild(el, audio);
     // Update ref — replaceChild swapped the node in DOM; update our ref manually
     (audioRef as React.MutableRefObject<HTMLAudioElement>).current = el;
-    el.play().catch((err: Error) => {
-      log(`[error] play() rejected: ${err.message}`);
-      setStatus('Playback error: ' + err.message);
-    });
+    attachAudioListeners(el);
+    if (!listeningPausedRef.current) {
+      el.play().catch((err: Error) => {
+        log(`[error] play() rejected: ${err.message}`);
+        setStatus('Playback error: ' + err.message);
+      });
+    }
     setStatus('In sync.');
   }
 
@@ -182,7 +227,7 @@ export function useSpotifySync() {
       setStatus('No matching track found on YouTube.');
       currentVideoIdRef.current = null;
       const audio = audioRef.current;
-      if (audio) { audio.pause(); audio.src = ''; }
+      if (audio) { pauseProgrammatic(audio); audio.src = ''; }
       return;
     }
 
@@ -227,12 +272,16 @@ export function useSpotifySync() {
     setIsAuthenticated(true);
 
     if (!data.is_playing) {
+      if (wasSpotifyPlayingRef.current === true) logEvent('spotify_pause', currentTrackIdRef.current);
+      wasSpotifyPlayingRef.current = false;
       setStatus('Spotify is paused or nothing is playing.');
-      audioRef.current?.pause();
+      pauseProgrammatic(audioRef.current);
       setIsPlaying(false);
       return;
     }
 
+    if (wasSpotifyPlayingRef.current === false) logEvent('spotify_play', currentTrackIdRef.current);
+    wasSpotifyPlayingRef.current = true;
     setTrackName(data.track);
     setArtistName(data.artist);
     setIsPlaying(data.is_playing);
@@ -242,20 +291,39 @@ export function useSpotifySync() {
       log(`\n--- ${data.track} – ${data.artist} ---`);
       log(`[debug] track changed: ${currentTrackIdRef.current} → ${data.track_id} (${data.track})`);
       currentTrackIdRef.current = data.track_id;
+      setTrackNotIdeal(false);
+      setTrackBugged(false);
+      setTrackAllSourcesTried(false);
+      setTrackSource('');
       await loadTrack(data, spotifySec);
       pollQueue();
+      fetch(`/youtube/track/${data.track_id}`)
+        .then((r) => r.ok ? r.json() : null)
+        .then((t) => {
+          if (t) {
+            setTrackNotIdeal(t.not_ideal);
+            setTrackBugged(t.bugged);
+            setTrackAllSourcesTried(t.allSourcesTried);
+            setTrackSource(t.source ?? '');
+          }
+        })
+        .catch(() => {});
     } else if (currentVideoIdRef.current) {
       if (++pollCountRef.current % 3 === 0) pollQueue();
       const audio = audioRef.current;
       if (audio) {
-        const drift = Math.abs(audio.currentTime - spotifySec);
-        if (drift > 2) {
-          setStatus(`Correcting drift (${drift.toFixed(1)}s)...`);
-          audio.currentTime = spotifySec;
+        if (audio.ended) {
+          setStatus('Czekam na następny utwór...');
         } else {
-          setStatus('In sync.');
+          const drift = Math.abs(audio.currentTime - spotifySec);
+          if (drift > 2) {
+            setStatus(`Correcting drift (${drift.toFixed(1)}s)...`);
+            audio.currentTime = spotifySec;
+          } else {
+            setStatus('In sync.');
+          }
+          if (audio.paused && !listeningPausedRef.current) audio.play().catch(() => {});
         }
-        if (audio.paused) audio.play().catch(() => {});
       }
     }
   }, [loadTrack, pollQueue]);
@@ -270,10 +338,59 @@ export function useSpotifySync() {
 
   const start = useCallback(() => {
     setStarted(true);
+    logEvent('start');
+  }, []);
+
+  const showFeedback = useCallback(() => {
+    setFeedbackMsg('Dziękujemy za feedback! Przy następnym razie wyszukamy innej wersji.');
+    setTimeout(() => setFeedbackMsg(null), 5000);
+  }, []);
+
+  const markNotIdeal = useCallback(() => {
+    const id = currentTrackIdRef.current;
+    if (!id) return;
+    setTrackNotIdeal(true);
+    setTrackBugged(false);
+    logEvent('not_ideal', id);
+    fetch(`/youtube/track/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ not_ideal: true }),
+    }).catch(() => {});
+    showFeedback();
+  }, [showFeedback]);
+
+  const markBugged = useCallback(() => {
+    const id = currentTrackIdRef.current;
+    if (!id) return;
+    setTrackBugged(true);
+    setTrackNotIdeal(false);
+    logEvent('bug', id);
+    fetch(`/youtube/track/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bugged: true }),
+    }).catch(() => {});
+    showFeedback();
+  }, [showFeedback]);
+
+  useEffect(() => {
+    const handleUnload = () => {
+      navigator.sendBeacon(
+        '/events',
+        new Blob(
+          [JSON.stringify({ action: 'exit', trackId: currentTrackIdRef.current, clientId })],
+          { type: 'application/json' }
+        )
+      );
+    };
+    window.addEventListener('beforeunload', handleUnload);
+    return () => window.removeEventListener('beforeunload', handleUnload);
   }, []);
 
   useEffect(() => {
     if (!started) return;
+    if (audioRef.current) attachAudioListeners(audioRef.current);
     poll();
     const pollInterval = setInterval(poll, 3000);
     updateListeners();
@@ -294,5 +411,13 @@ export function useSpotifySync() {
     status,
     listenerCount,
     audioRef,
+    isListeningPaused,
+    trackNotIdeal,
+    trackBugged,
+    trackAllSourcesTried,
+    trackSource,
+    feedbackMsg,
+    markNotIdeal,
+    markBugged,
   };
 }

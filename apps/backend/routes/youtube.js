@@ -3,6 +3,7 @@ const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const YTMusic = require('ytmusic-api');
+const { prisma } = require('../lib/db');
 
 const router = express.Router();
 const DURATION_TOLERANCE_MS = 10000;
@@ -19,26 +20,8 @@ function refreshCookiesTmp() {
     console.error('[cookies] failed to copy cookies.txt:', err.message);
   }
 }
-const TRACK_CACHE_FILE = path.join(__dirname, '..', 'cache.json');
-
 const ytmusic = new YTMusic();
 const ytmusicReady = ytmusic.initialize();
-
-// --- Persistent track→videoId cache (survives restarts) ---
-
-let trackCache = {};
-try {
-  const raw = JSON.parse(fs.readFileSync(TRACK_CACHE_FILE, 'utf8'));
-  // Migrate old format (string videoId) to new format (object)
-  for (const [id, val] of Object.entries(raw)) {
-    trackCache[id] = typeof val === 'string' ? { videoId: val } : val;
-  }
-  console.log(`[cache] loaded ${Object.keys(trackCache).length} entries from cache.json`);
-} catch (_) {}
-
-function saveTrackCache() {
-  fs.writeFileSync(TRACK_CACHE_FILE, JSON.stringify(trackCache, null, 2));
-}
 
 // Cookies are managed manually — upload fresh cookies.txt when they expire.
 
@@ -166,7 +149,29 @@ function resolveUrl(videoId) {
   return promise;
 }
 
+async function odesliLookup(trackId) {
+  try {
+    const url = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(`https://open.spotify.com/track/${trackId}`)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const platforms = data.linksByPlatform ?? {};
+    for (const key of ['youtubeMusic', 'youtube']) {
+      const link = platforms[key]?.url;
+      if (link) {
+        const videoId = new URL(link).searchParams.get('v');
+        if (videoId) return videoId;
+      }
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // --- Routes ---
+
+const INSTRUMENTAL_RE = /\b(instrumental|karaoke|off[\s-]?vocal|backing[\s-]?track|inst\.?)\b|[\[(（]inst[\]）)]|インスト|カラオケ|オフボーカル|\bMR\b/i;
 
 // GET /youtube/search?track=...&artist=...&duration_ms=...&track_id=...
 router.get('/search', async (req, res) => {
@@ -176,34 +181,194 @@ router.get('/search', async (req, res) => {
     return res.status(400).json({ error: 'track, artist and duration_ms are required' });
   }
 
-  // Persistent cache hit — no ytmusic-api call needed
-  if (track_id && trackCache[track_id]) {
-    console.log(`[search] cache hit for ${track_id}`);
-    return res.json({ videoId: trackCache[track_id].videoId });
+  const targetMs = parseInt(duration_ms, 10);
+
+  if (track_id) {
+    const cached = await prisma.track.findUnique({
+      where: { id: track_id },
+      include: { blacklist: true },
+    });
+
+    if (cached) {
+      // All sources already exhausted — no re-search possible
+      if (cached.allSourcesTried) {
+        console.log(`[search] allSourcesTried for ${track_id}`);
+        return res.json({ videoId: cached.videoId, allSourcesTried: true });
+      }
+
+      const blacklistedIds = new Set(cached.blacklist.map((b) => b.videoId));
+
+      // prefer_duration (not_ideal) — bypass cache, text search sorted by duration
+      if (cached.searchMode === 'prefer_duration') {
+        console.log(`[search] prefer_duration for ${track_id}, searching for better duration match`);
+        await ytmusicReady;
+        const pdResults = await ytmusic.searchSongs(`${track} ${artist}`);
+        const candidates = pdResults
+          .filter((s) => s.videoId && s.duration && !INSTRUMENTAL_RE.test(s.name))
+          .sort((a, b) => Math.abs(a.duration * 1000 - targetMs) - Math.abs(b.duration * 1000 - targetMs));
+        const pdMatch = candidates[0] ?? null;
+        await prisma.track.update({
+          where: { id: track_id },
+          data: {
+            ...(pdMatch ? { videoId: pdMatch.videoId, ytTitle: pdMatch.name, source: 'search' } : {}),
+            searchMode: 'default',
+            not_ideal: false,
+          },
+        });
+        const pdFinalId = pdMatch ? pdMatch.videoId : cached.videoId;
+        console.log(`[search] prefer_duration result for ${track_id} → ${pdFinalId}${pdMatch ? '' : ' (no better found, keeping current)'}`);
+        return res.json({ videoId: pdFinalId, allSourcesTried: false });
+      }
+
+      // Cache valid — current videoId not on blacklist
+      if (!blacklistedIds.has(cached.videoId)) {
+        console.log(`[search] cache hit for ${track_id}`);
+        // Backfill ytTitle in background if missing
+        if (!cached.ytTitle) {
+          ytmusicReady
+            .then(() => ytmusic.searchSongs(`${track} ${artist}`))
+            .then((results) => {
+              const match = results.find((s) => s.videoId === cached.videoId);
+              if (match?.name) {
+                console.log(`[search] backfilling ytTitle for ${track_id}: ${match.name}`);
+                return prisma.track.update({ where: { id: track_id }, data: { ytTitle: match.name } });
+              }
+            })
+            .catch(() => {});
+        }
+        return res.json({ videoId: cached.videoId, allSourcesTried: false });
+      }
+
+      // Current videoId is blacklisted — re-search
+      console.log(`[search] ${track_id} blacklisted, re-searching (mode=${cached.searchMode})`);
+
+      // Odesli — only for default mode (bugged), not for prefer_duration (not_ideal)
+      if (cached.searchMode === 'default') {
+        const odesliId = await odesliLookup(track_id);
+        if (odesliId && !blacklistedIds.has(odesliId)) {
+          console.log(`[search] odesli re-hit for ${track_id} → ${odesliId}`);
+          await prisma.track.update({
+            where: { id: track_id },
+            data: { videoId: odesliId, source: 'odesli', searchMode: 'default', not_ideal: false, bugged: false },
+          });
+          return res.json({ videoId: odesliId, allSourcesTried: false });
+        }
+      }
+
+      // Text search — exclude blacklisted and instrumentals
+      await ytmusicReady;
+      const results = await ytmusic.searchSongs(`${track} ${artist}`);
+      const candidates = results.filter(
+        (s) => s.videoId && s.duration && !blacklistedIds.has(s.videoId) && !INSTRUMENTAL_RE.test(s.name)
+      );
+
+      let match = null;
+      if (cached.searchMode === 'prefer_duration') {
+        // Sort by closest duration — no hard tolerance
+        candidates.sort((a, b) => Math.abs(a.duration * 1000 - targetMs) - Math.abs(b.duration * 1000 - targetMs));
+        match = candidates[0] ?? null;
+      } else {
+        // Standard — within ±10s tolerance
+        match = candidates.find((s) => Math.abs(s.duration * 1000 - targetMs) <= DURATION_TOLERANCE_MS) ?? null;
+      }
+
+      if (match) {
+        console.log(`[search] re-search text hit for ${track_id} → ${match.videoId}`);
+        await prisma.track.update({
+          where: { id: track_id },
+          data: { videoId: match.videoId, ytTitle: match.name, source: 'search', searchMode: 'default', not_ideal: false, bugged: false },
+        });
+        return res.json({ videoId: match.videoId, allSourcesTried: false });
+      }
+
+      // Nothing found — Odesli emergency whitelist
+      console.log(`[search] all sources exhausted for ${track_id}, using Odesli emergency whitelist`);
+      const emergencyId = await odesliLookup(track_id);
+      const finalId = emergencyId ?? cached.videoId;
+      await prisma.track.update({
+        where: { id: track_id },
+        data: { videoId: finalId, allSourcesTried: true, searchMode: 'default', not_ideal: false, bugged: false },
+      });
+      return res.json({ videoId: finalId, allSourcesTried: true });
+    }
   }
 
-  const targetMs = parseInt(duration_ms, 10);
+  // First-time search — no Track in DB yet
+
+  // Odesli lookup
+  if (track_id) {
+    const videoId = await odesliLookup(track_id);
+    if (videoId) {
+      console.log(`[search] odesli hit for ${track_id} → ${videoId}`);
+      await prisma.track.upsert({
+        where: { id: track_id },
+        create: { id: track_id, videoId, track, artist, source: 'odesli' },
+        update: { videoId, source: 'odesli' },
+      });
+      return res.json({ videoId, allSourcesTried: false });
+    }
+    console.log(`[search] odesli miss for ${track_id}, falling back to search`);
+  }
 
   await ytmusicReady;
   const results = await ytmusic.searchSongs(`${track} ${artist}`);
-
-  const INSTRUMENTAL_RE = /\b(instrumental|karaoke|off[\s-]?vocal|backing[\s-]?track|inst\.?)\b|[\[(（]inst[\]）)]|インスト|カラオケ|オフボーカル|\bMR\b/i;
-
-  const durationMatches = results.filter((song) => {
-    if (!song.duration) return false;
-    return Math.abs(song.duration * 1000 - targetMs) <= DURATION_TOLERANCE_MS;
-  });
-
+  const durationMatches = results.filter(
+    (s) => s.duration && Math.abs(s.duration * 1000 - targetMs) <= DURATION_TOLERANCE_MS
+  );
   const match = durationMatches.find((s) => !INSTRUMENTAL_RE.test(s.name)) ?? durationMatches[0] ?? null;
-
   const videoId = match ? match.videoId : null;
 
   if (videoId && track_id) {
-    trackCache[track_id] = { videoId, track, artist, ytTitle: match.name };
-    saveTrackCache();
+    await prisma.track.upsert({
+      where: { id: track_id },
+      create: { id: track_id, videoId, track, artist, ytTitle: match.name, source: 'search' },
+      update: { videoId, ytTitle: match.name, source: 'search' },
+    });
   }
 
-  res.json({ videoId });
+  res.json({ videoId: videoId ?? null, allSourcesTried: false });
+});
+
+// GET /youtube/track/:id
+router.get('/track/:id', async (req, res) => {
+  const track = await prisma.track.findUnique({ where: { id: req.params.id } });
+  if (!track) return res.status(404).json({ error: 'not found' });
+  res.json(track);
+});
+
+// PATCH /youtube/track/:id — blacklistuje videoId i ustawia tryb re-searchu
+router.patch('/track/:id', async (req, res) => {
+  const { not_ideal, bugged } = req.body;
+  if (!not_ideal && !bugged) return res.status(400).json({ error: 'not_ideal or bugged required' });
+
+  const reason = not_ideal ? 'not_ideal' : 'bugged';
+
+  try {
+    const track = await prisma.track.findUnique({ where: { id: req.params.id } });
+    if (!track) return res.status(404).json({ error: 'track not found' });
+
+    if (reason === 'bugged') {
+      await prisma.videoBlacklist.upsert({
+        where: { trackId_videoId: { trackId: req.params.id, videoId: track.videoId } },
+        create: { trackId: req.params.id, videoId: track.videoId, reason },
+        update: { reason },
+      });
+    }
+
+    await prisma.track.update({
+      where: { id: req.params.id },
+      data: {
+        not_ideal: reason === 'not_ideal',
+        bugged: reason === 'bugged',
+        allSourcesTried: false,
+        searchMode: reason === 'not_ideal' ? 'prefer_duration' : 'default',
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (_) {
+    res.status(500).json({ error: 'internal error' });
+  }
 });
 
 // GET /youtube/prefetch/:videoId — resolves CDN URL in background and caches it

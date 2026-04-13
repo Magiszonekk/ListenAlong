@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const { prisma } = require('../lib/db');
 const router = express.Router();
 
 let accessToken = null;
@@ -51,6 +52,14 @@ router.get('/callback', async (req, res) => {
   accessToken = response.data.access_token;
   refreshToken = response.data.refresh_token;
   tokenExpiresAt = Date.now() + 3300000; // 55 minutes
+
+  prisma.authEvent.create({
+    data: {
+      ip: req.headers['x-forwarded-for'] ?? req.ip ?? 'unknown',
+      userAgent: req.headers['user-agent'] ?? null,
+      action: 'login',
+    },
+  }).catch(() => {});
 
   res.redirect('/');
 });

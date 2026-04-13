@@ -1,3 +1,4 @@
+import { Bug } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AudioPlayer } from '@/components/AudioPlayer';
 import { NowPlaying } from '@/components/NowPlaying';
@@ -15,6 +16,13 @@ export default function App() {
     status,
     listenerCount,
     audioRef,
+    trackNotIdeal,
+    trackBugged,
+    trackAllSourcesTried,
+    trackSource,
+    feedbackMsg,
+    markNotIdeal,
+    markBugged,
   } = useSpotifySync();
 
   const listenersText =
@@ -53,6 +61,43 @@ export default function App() {
       )}
 
       <AudioPlayer audioRef={audioRef} />
+
+      {started && (
+        <div className="flex flex-col items-center gap-3">
+          <div className="flex items-center gap-3">
+            {trackSource === 'odesli' && (
+              <Button
+                onClick={markNotIdeal}
+                disabled={trackNotIdeal || trackAllSourcesTried}
+                title={trackAllSourcesTried ? 'Sprawdzono wszystkie źródła' : 'Zgłoś niedopasowanie (znajdziemy wersję o lepszym czasie)'}
+                className={trackNotIdeal
+                  ? "bg-yellow-600 text-white rounded-full w-11 h-11 text-base font-bold p-0 opacity-60 cursor-not-allowed"
+                  : "bg-neutral-800 text-neutral-400 hover:bg-yellow-600 hover:text-white rounded-full w-11 h-11 text-base font-bold p-0 disabled:opacity-40 disabled:cursor-not-allowed"
+                }
+              >
+                ~
+              </Button>
+            )}
+            <Button
+              onClick={markBugged}
+              disabled={trackBugged || trackAllSourcesTried}
+              title={trackAllSourcesTried ? 'Sprawdzono wszystkie źródła' : 'Zgłoś buga (znajdziemy inne źródło)'}
+              className={trackBugged
+                ? "bg-red-600 text-white rounded-full w-11 h-11 text-lg font-bold p-0 opacity-60 cursor-not-allowed"
+                : "bg-neutral-800 text-neutral-400 hover:bg-red-600 hover:text-white rounded-full w-11 h-11 text-lg font-bold p-0 disabled:opacity-40 disabled:cursor-not-allowed"
+              }
+            >
+              <Bug size={18} />
+            </Button>
+          </div>
+          {feedbackMsg && (
+            <p className="text-xs text-neutral-400 text-center">{feedbackMsg}</p>
+          )}
+          {trackAllSourcesTried && (
+            <p className="text-xs text-neutral-500 text-center">Sprawdzono wszystkie źródła — brak lepszej wersji.</p>
+          )}
+        </div>
+      )}
     </div>
   );
 }

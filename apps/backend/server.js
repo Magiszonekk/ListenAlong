@@ -3,6 +3,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const { prisma } = require('./lib/db');
 
 // Start Xvfb for headful Camoufox sessions
 const xvfb = spawn('Xvfb', [':99', '-screen', '0', '1280x720x24'], {
@@ -72,6 +73,19 @@ app.post('/log', (req, res) => {
   if (typeof msg !== 'string') return res.status(400).end();
   const line = `${new Date().toISOString()} [frontend] ${msg}\n`;
   getLogStream().write(line);
+  res.end();
+});
+
+// POST /events — frontend event log (start, pause, resume, spotify_pause, spotify_play, bug, not_ideal, exit)
+app.post('/events', async (req, res) => {
+  const clientId = req.headers['x-client-id'] || req.body.clientId;
+  const { action, trackId } = req.body;
+  if (!clientId || typeof action !== 'string') return res.status(400).end();
+  const ip = req.headers['x-forwarded-for'] ?? req.ip ?? null;
+  prisma.userEvent.create({
+    data: { clientId, action, trackId: trackId ?? null, ip },
+  }).catch(() => {});
+  console.log(`[event] ${clientId.slice(0, 6)} ${action}${trackId ? ` (${trackId})` : ''}`);
   res.end();
 });
 
