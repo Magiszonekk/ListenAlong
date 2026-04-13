@@ -8,6 +8,7 @@
     "studio": "npx prisma studio"
   },
   "dependencies": {
+    "@listenalong/config": "*",
     "@prisma/client": "^6.0.0",
     "axios": "^1.15.0",
     "dotenv": "^17.4.1",

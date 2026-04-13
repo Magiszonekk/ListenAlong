@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import config from '@listenalong/config';
 
 // Per-tab client ID (persisted in sessionStorage for heartbeat tracking)
 function getClientId(): string {
@@ -423,9 +424,9 @@ export function useSpotifySync() {
     if (!started) return;
     if (audioRef.current) attachAudioListeners(audioRef.current);
     poll();
-    const pollInterval = setInterval(poll, 3000);
+    const pollInterval = setInterval(poll, config.polling.spotifyMs);
     updateListeners();
-    const listenersInterval = setInterval(updateListeners, 5000);
+    const listenersInterval = setInterval(updateListeners, config.polling.listenersMs);
     return () => {
       clearInterval(pollInterval);
       clearInterval(listenersInterval);

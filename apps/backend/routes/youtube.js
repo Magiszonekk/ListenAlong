@@ -1,3 +1,4 @@
+const { search: searchConfig } = require('@listenalong/config');
 const express = require('express');
 const { execFile } = require('child_process');
 const path = require('path');
@@ -171,7 +172,7 @@ async function odesliLookup(trackId) {
 // --- Routes ---
 
 const NOISE_RE = /\b(instrumental|karaoke|off[\s-]?vocal|backing[\s-]?track|inst\.?|nightcore|nighcore|cover|ai\s+cover|slowed|reverb|sped[\s-]?up|speed[\s-]?up|(?:english|spanish|french|portuguese|german|italian|dutch|korean|chinese)\s+(?:ver(?:sion)?\.?|dub)|translat(?:ion|ed))\b|[\[(（](?:inst|english)[\]）)]|インスト|カラオケ|オフボーカル|\bMR\b/i;
-const ODESLI_BONUS_MS = 20000;
+const ODESLI_BONUS_MS = searchConfig.odesliBonus;
 
 async function searchYouTube(track, artist) {
   return new Promise((resolve) => {
@@ -213,11 +214,11 @@ function titleRelevance(title, track, artist) {
   return words.filter((w) => t.includes(w)).length / words.length;
 }
 
-const TITLE_BONUS_MS = 15000;
+const TITLE_BONUS_MS = searchConfig.titleBonus;
 
 // CJK: hiragana, katakana, CJK unified ideographs, Hangul syllables
 const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
-const SCRIPT_BONUS_MS = 10000;
+const SCRIPT_BONUS_MS = searchConfig.scriptBonus;
 
 function scriptBonus(title, track, artist) {
   if (!CJK_RE.test(track) && !CJK_RE.test(artist)) return 0;
