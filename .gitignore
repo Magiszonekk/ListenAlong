@@ -4,3 +4,5 @@ cache.json
 logs
 cookies_tmp.txt
 .env
+data.db
+**/data.db
