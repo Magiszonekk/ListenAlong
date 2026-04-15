@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import config from '@listenalong/config';
 
 // Client ID persisted in localStorage — same ID across tabs and sessions
 function getClientId(): string {
@@ -47,6 +46,11 @@ function logEvent(action: string, trackId?: string | null) {
   }).catch(() => {});
 }
 
+function getWsUrl(): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${window.location.host}/ws`;
+}
+
 interface NowPlaying {
   track: string;
   artist: string;
@@ -54,6 +58,8 @@ interface NowPlaying {
   duration_ms: number;
   progress_ms: number;
   is_playing: boolean;
+  auth_error?: boolean;
+  serverAge?: number;
 }
 
 interface QueueTrack {
@@ -64,6 +70,8 @@ interface QueueTrack {
 }
 
 export function useSpotifySync() {
+  const isDev = localStorage.getItem('dev') === 'true';
+
   const [started, setStarted] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(true);
   const [trackName, setTrackName] = useState('—');
@@ -75,8 +83,6 @@ export function useSpotifySync() {
   const programmaticPauseRef = useRef(false);
   const spotifyPausedRef = useRef(false);
   const wasSpotifyPlayingRef = useRef<boolean | null>(null);
-  const pendingTrackIdRef = useRef<string | null>(null);
-  const prevProgressRef = useRef<number | null>(null);
 
   function pauseProgrammatic(audio: HTMLAudioElement | null | undefined) {
     if (!audio) return;
@@ -105,6 +111,21 @@ export function useSpotifySync() {
       localStorage.setItem('audioVolume', String(el.volume));
       localStorage.setItem('audioMuted', String(el.muted));
     });
+    el.addEventListener('error', () => {
+      const videoId = currentVideoIdRef.current;
+      if (!videoId) return;
+      if (el.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+        // 500 JSON from backend — ?fresh=1 won't help, would create an infinite retry loop
+        log(`[error] audio format error (code=4) for ${videoId} — cannot recover with fresh URL`);
+        setStatus('Stream error.');
+        return;
+      }
+      log(`[error] audio stream error (code=${el.error?.code}) — refreshing URL for ${videoId}`);
+      setStatus('Stream error — refreshing...');
+      el.src = `/youtube/audio/${videoId}?fresh=1`;
+      el.load();
+      if (!listeningPausedRef.current) el.play().catch(() => {});
+    });
   }
   const [listenerCount, setListenerCount] = useState<number | null>(null);
   const [clientIds, setClientIds] = useState<string[]>([]);
@@ -119,7 +140,22 @@ export function useSpotifySync() {
 
   const currentTrackIdRef = useRef<string | null>(null);
   const currentVideoIdRef = useRef<string | null>(null);
-  const pollCountRef = useRef(0);
+
+  // WebSocket
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectDelayRef = useRef<number>(1000);
+  const pingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Last WS now_playing state — used for fresh position on canplay
+  const lastNowPlayingRef = useRef<NowPlaying | null>(null);
+  const lastWsTimestampRef = useRef<number>(0);
+
+  // Measured round-trip time to server in ms (EWMA-smoothed)
+  const pingMsRef = useRef<number>(0);
+
+  // User-defined sync compensation in ms (persisted in localStorage)
+  const compensationMsRef = useRef<number>(parseFloat(localStorage.getItem('syncCompensation') ?? '0') || 0);
 
   // Prefetch state
   const prefetchTrackIdRef = useRef<string | null>(null);
@@ -188,14 +224,6 @@ export function useSpotifySync() {
     } catch (_) {}
   }, []);
 
-  const pollQueue = useCallback(async () => {
-    try {
-      const res = await fetch('/spotify/queue');
-      const data = await res.json();
-      prefetchNext(data.next);
-    } catch (_) {}
-  }, [prefetchNext]);
-
   // --- Load track ---
 
   const loadTrack = useCallback(async (data: NowPlaying, spotifySec: number) => {
@@ -220,8 +248,16 @@ export function useSpotifySync() {
             log(`[debug] prefetchAudio canplay stale — skipping (expected ${expectedVideoId}/${expectedTrackId}, now ${prefetchVideoIdRef.current}/${currentTrackIdRef.current})`);
             return;
           }
-          log(`[debug] prefetchAudio canplay fired, swapping to ${expectedVideoId}`);
-          seekThenSwap(pa, spotifySec);
+          log(`[debug] prefetchAudio canplay fired, computing fresh position for ${expectedVideoId}...`);
+          let sec = spotifySec;
+          const lastWs = lastNowPlayingRef.current;
+          const wsAgeMs = Date.now() - lastWsTimestampRef.current;
+          if (lastWs?.track_id === expectedTrackId && lastWs.is_playing) {
+            const halfRttSec = pingMsRef.current / 2 / 1000;
+            sec = lastWs.progress_ms / 1000 + wsAgeMs / 1000 + halfRttSec + compensationMsRef.current / 1000;
+            log(`[debug] fresh sync: ${sec.toFixed(2)}s (ws age ${wsAgeMs}ms + rtt/2 ${(halfRttSec * 1000).toFixed(1)}ms, fallback was ${spotifySec.toFixed(2)}s)`);
+          }
+          seekThenSwap(pa, sec);
           const newPa = new Audio();
           newPa.preload = 'auto';
           prefetchAudioRef.current = newPa;
@@ -265,34 +301,89 @@ export function useSpotifySync() {
         log(`[debug] canplay stale for ${ytData.videoId} — skipping (expected ${expectedTrackId}, now ${currentTrackIdRef.current})`);
         return;
       }
-      log(`[debug] canplay fired for ${ytData.videoId}, seeking then swapping`);
-      seekThenSwap(newAudio, spotifySec);
+      log(`[debug] canplay fired for ${ytData.videoId}, computing fresh position...`);
+      let sec = spotifySec;
+      const lastWs = lastNowPlayingRef.current;
+      const wsAgeMs = Date.now() - lastWsTimestampRef.current;
+      if (lastWs?.track_id === expectedTrackId && lastWs.is_playing) {
+        const halfRttSec = pingMsRef.current / 2 / 1000;
+        sec = lastWs.progress_ms / 1000 + wsAgeMs / 1000 + halfRttSec + compensationMsRef.current / 1000;
+        log(`[debug] fresh sync: ${sec.toFixed(2)}s (ws age ${wsAgeMs}ms + rtt/2 ${(halfRttSec * 1000).toFixed(1)}ms, fallback was ${spotifySec.toFixed(2)}s)`);
+      }
+      seekThenSwap(newAudio, sec);
     }, { once: true });
-    newAudio.addEventListener('error', () => {
+    let networkRetried = false;
+    let altSearchCount = 0;
+    const MAX_ALT_SEARCHES = 5;
+    let currentFailedVideoId = ytData.videoId!;
+    const failedVideoIds = new Set<string>([ytData.videoId!]);
+    newAudio.addEventListener('error', async () => {
       const e = newAudio.error;
-      log(`[error] newAudio failed for ${ytData.videoId}: code=${e?.code ?? '?'} message=${e?.message ?? '?'}`);
-      setStatus('Audio load error — retrying...');
+      log(`[error] newAudio failed for ${currentFailedVideoId}: code=${e?.code ?? '?'} message=${e?.message ?? '?'}`);
+
+      if (currentTrackIdRef.current !== expectedTrackId) {
+        setStatus('Audio load error.');
+        currentVideoIdRef.current = null;
+        currentTrackIdRef.current = null;
+        return;
+      }
+
+      if (e?.code === MediaError.MEDIA_ERR_NETWORK && !networkRetried) {
+        networkRetried = true;
+        log(`[error] MEDIA_ERR_NETWORK — retrying with fresh URL for ${currentFailedVideoId}`);
+        setStatus('Stream error — retrying...');
+        newAudio.src = `/youtube/audio/${currentFailedVideoId}?fresh=1`;
+        newAudio.load();
+        return;
+      }
+
+      if (e?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED && altSearchCount < MAX_ALT_SEARCHES) {
+        altSearchCount++;
+        const failedId = currentFailedVideoId;
+        failedVideoIds.add(failedId);
+        const blacklistParam = [...failedVideoIds].map(encodeURIComponent).join(',');
+        log(`[error] MEDIA_ERR_SRC_NOT_SUPPORTED for ${failedId} — searching for alternative (attempt ${altSearchCount})`);
+        setStatus('Finding alternative...');
+        try {
+          const res = await fetch(
+            `/youtube/search?track=${encodeURIComponent(data.track)}&artist=${encodeURIComponent(data.artist)}&duration_ms=${data.duration_ms}&track_id=${encodeURIComponent(data.track_id)}&blacklist=${blacklistParam}`,
+            { signal: AbortSignal.timeout(20000) }
+          );
+          const newYt: { videoId: string | null; allSourcesTried?: boolean } = await res.json();
+          if (currentTrackIdRef.current !== expectedTrackId) return; // stale — track changed
+          if (!newYt.allSourcesTried && newYt.videoId && !failedVideoIds.has(newYt.videoId)) {
+            log(`[error] alternative found: ${newYt.videoId} — loading (attempt ${altSearchCount})`);
+            currentVideoIdRef.current = newYt.videoId;
+            currentFailedVideoId = newYt.videoId;
+            networkRetried = false;
+            newAudio.src = `/youtube/audio/${newYt.videoId}`;
+            newAudio.load();
+            return;
+          }
+        } catch (_) {}
+        log(`[error] no alternative found for ${data.track_id} after ${altSearchCount} attempt(s)`);
+        setStatus('No alternative available.');
+        currentVideoIdRef.current = null;
+        // Keep currentTrackIdRef as expectedTrackId to prevent re-trigger loop on next poll
+        return;
+      }
+
+      setStatus('Audio load error.');
       currentVideoIdRef.current = null;
       currentTrackIdRef.current = null;
-    }, { once: true });
+    });
     newAudio.load();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // --- Poll ---
+  // --- Handle now_playing from WebSocket ---
 
-  const poll = useCallback(async () => {
-    let data: NowPlaying;
-    try {
-      const res = await fetch('/spotify/now-playing');
-      if (res.status === 401) {
-        setIsAuthenticated(false);
-        setStatus('Not authenticated — please log in.');
-        return;
-      }
-      data = await res.json();
-    } catch (err) {
-      setStatus('Network error: ' + (err as Error).message);
+  const handleNowPlaying = useCallback(async (data: NowPlaying) => {
+    lastNowPlayingRef.current = data;
+    lastWsTimestampRef.current = Date.now() - (data.serverAge ?? 0);
+    if (data.auth_error) {
+      setIsAuthenticated(false);
+      setStatus('Not authenticated — please log in.');
       return;
     }
 
@@ -320,21 +411,9 @@ export function useSpotifySync() {
     setTrackName(data.track);
     setArtistName(data.artist);
     setIsPlaying(data.is_playing);
-    const spotifySec = data.progress_ms / 1000;
-
-    const isProgressJump = prevProgressRef.current !== null &&
-      data.is_playing &&
-      data.progress_ms < prevProgressRef.current - 5000;
-    prevProgressRef.current = data.progress_ms;
+    const spotifySec = data.progress_ms / 1000 + compensationMsRef.current / 1000;
 
     if (data.track_id !== currentTrackIdRef.current) {
-      const isFirstTrack = currentTrackIdRef.current === null;
-      if (!isFirstTrack && !isProgressJump && pendingTrackIdRef.current !== data.track_id) {
-        pendingTrackIdRef.current = data.track_id;
-        log(`[debug] pending track change: ${data.track_id} (${data.track}) — awaiting confirmation`);
-        return;
-      }
-      pendingTrackIdRef.current = null;
       log(`\n--- ${data.track} – ${data.artist} ---`);
       log(`[debug] track changed: ${currentTrackIdRef.current} → ${data.track_id} (${data.track})`);
       currentTrackIdRef.current = data.track_id;
@@ -343,7 +422,7 @@ export function useSpotifySync() {
       setTrackAllSourcesTried(false);
       setTrackSource('');
       await loadTrack(data, spotifySec);
-      pollQueue();
+      // queue arrives separately via 'queue' WS message → prefetchNext
       fetch(`/youtube/track/${data.track_id}`)
         .then((r) => r.ok ? r.json() : null)
         .then((t) => {
@@ -356,21 +435,17 @@ export function useSpotifySync() {
         })
         .catch(() => {});
     } else {
-      if (pendingTrackIdRef.current !== null) {
-        log(`[debug] track_id reverted to current — glitch detected, resetting pending`);
-      }
-      pendingTrackIdRef.current = null;
       if (currentVideoIdRef.current) {
-        if (++pollCountRef.current % 3 === 0) pollQueue();
         const audio = audioRef.current;
         if (audio) {
           if (audio.ended) {
             setStatus('Czekam na następny utwór...');
           } else {
-            const drift = Math.abs(audio.currentTime - spotifySec);
+            const adjustedSec = spotifySec + pingMsRef.current / 2 / 1000;
+            const drift = Math.abs(audio.currentTime - adjustedSec);
             if (drift > 2) {
               setStatus(`Correcting drift (${drift.toFixed(1)}s)...`);
-              audio.currentTime = spotifySec;
+              audio.currentTime = adjustedSec;
             } else {
               setStatus('In sync.');
             }
@@ -379,16 +454,60 @@ export function useSpotifySync() {
         }
       }
     }
-  }, [loadTrack, pollQueue]);
+  }, [loadTrack]);
 
-  const updateListeners = useCallback(async () => {
-    try {
-      const res = await fetch('/clients');
-      const data = await res.json();
-      setListenerCount(data.count);
-      setClientIds(data.clientIds ?? []);
-    } catch (_) {}
-  }, []);
+  // --- WebSocket connection ---
+
+  const connectWebSocket = useCallback(() => {
+    if (
+      wsRef.current?.readyState === WebSocket.OPEN ||
+      wsRef.current?.readyState === WebSocket.CONNECTING
+    ) return;
+
+    const ws = new WebSocket(getWsUrl());
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      reconnectDelayRef.current = 1000;
+      ws.send(JSON.stringify({ type: 'identify', clientId }));
+      ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+      pingTimerRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+      }, 25000);
+      log('[ws] connected');
+    };
+
+    ws.onmessage = (event: MessageEvent) => {
+      let msg: Record<string, unknown>;
+      try { msg = JSON.parse(event.data as string); } catch { return; }
+      if (msg.type === 'now_playing') handleNowPlaying(msg as unknown as NowPlaying);
+      else if (msg.type === 'pong' && typeof msg.ts === 'number') {
+        const rtt = Date.now() - (msg.ts as number);
+        pingMsRef.current = pingMsRef.current === 0 ? rtt : 0.7 * pingMsRef.current + 0.3 * rtt;
+        log(`[ping] rtt=${rtt}ms smoothed=${pingMsRef.current.toFixed(1)}ms`);
+      }
+      else if (msg.type === 'queue') prefetchNext((msg.next as QueueTrack | null));
+      else if (msg.type === 'listeners') {
+        setListenerCount(msg.count as number);
+        setClientIds((msg.clientIds as string[]) ?? []);
+      }
+    };
+
+    ws.onclose = () => {
+      log(`[ws] disconnected — retry in ${reconnectDelayRef.current}ms`);
+      setStatus('Reconnecting...');
+      if (pingTimerRef.current) { clearInterval(pingTimerRef.current); pingTimerRef.current = null; }
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectDelayRef.current = Math.min(reconnectDelayRef.current * 2, 30000);
+        connectWebSocket();
+      }, reconnectDelayRef.current);
+    };
+
+    ws.onerror = (err) => {
+      log(`[ws] error: ${(err as ErrorEvent).message}`);
+      ws.close();
+    };
+  }, [handleNowPlaying, prefetchNext]);
 
   const start = useCallback(() => {
     setStarted(true);
@@ -428,6 +547,31 @@ export function useSpotifySync() {
     showFeedback();
   }, [showFeedback]);
 
+  const forceSync = useCallback(() => {
+    const audio = audioRef.current;
+    const lastWs = lastNowPlayingRef.current;
+    if (!audio || !lastWs) return;
+    const elapsedMs = Date.now() - lastWsTimestampRef.current;
+    const adjustedSec = lastWs.progress_ms / 1000 + elapsedMs / 1000 + pingMsRef.current / 2 / 1000 + compensationMsRef.current / 1000;
+    audio.currentTime = adjustedSec;
+  }, []);
+
+  const setCompensationMs = useCallback((ms: number) => {
+    compensationMsRef.current = ms;
+    localStorage.setItem('syncCompensation', String(ms));
+  }, []);
+
+  const getPlayerProgress = useCallback(() => {
+    return audioRef.current?.currentTime ?? 0;
+  }, []);
+
+  const getSpotifyProgress = useCallback(() => {
+    const lastWs = lastNowPlayingRef.current;
+    if (!lastWs) return 0;
+    const elapsedMs = Date.now() - lastWsTimestampRef.current;
+    return lastWs.progress_ms / 1000 + elapsedMs / 1000;
+  }, []);
+
   useEffect(() => {
     const handleUnload = () => {
       navigator.sendBeacon(
@@ -448,15 +592,14 @@ export function useSpotifySync() {
       attachAudioListeners(audioRef.current);
       applyStoredVolume(audioRef.current);
     }
-    poll();
-    const pollInterval = setInterval(poll, config.polling.spotifyMs);
-    updateListeners();
-    const listenersInterval = setInterval(updateListeners, config.polling.listenersMs);
+    connectWebSocket();
     return () => {
-      clearInterval(pollInterval);
-      clearInterval(listenersInterval);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (pingTimerRef.current) clearInterval(pingTimerRef.current);
+      wsRef.current?.close();
+      wsRef.current = null;
     };
-  }, [started, poll, updateListeners]);
+  }, [started, connectWebSocket]);
 
   return {
     started,
@@ -477,5 +620,10 @@ export function useSpotifySync() {
     feedbackMsg,
     markNotIdeal,
     markBugged,
+    isDev,
+    forceSync,
+    getPlayerProgress,
+    getSpotifyProgress,
+    setCompensationMs,
   };
 }

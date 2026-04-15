@@ -58,4 +58,13 @@ model UserEvent {
   action    String
   ip        String?
   createdAt DateTime @default(now())
+
+  @@index([createdAt, trackId])
+}
+
+model UrlCache {
+  videoId   String   @id
+  url       String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
 }

@@ -29,11 +29,14 @@ const ytmusicReady = ytmusic.initialize();
 
 const urlCache = new Map();        // videoId → { url, expiresAt }
 const pendingResolves = new Map(); // videoId → Promise (dedup same-video calls)
-const URL_CACHE_TTL = 5 * 60 * 60 * 1000; // 5h
+const permanentlyFailed = new Set(); // videoId → no audio formats (cleared on restart)
 const COOKIE_REFRESH_INTERVAL = 25 * 60 * 1000; // 25 minut
 
 // Serialize all yt-dlp calls — YouTube rate-limits bursts from one IP
 let ytdlpQueue = Promise.resolve();
+let lastYtdlpAt = 0; // timestamp of last yt-dlp start — throttle only consecutive calls
+
+const YTDLP_PORT = process.env.YTDLP_SERVER_PORT || 9091;
 
 // Cookie refresh state
 let cookieRefreshPromise = null;
@@ -42,43 +45,78 @@ let lastCookieRefreshAt = Date.now(); // treat startup cookies as fresh
 function getCachedUrl(videoId) {
   const entry = urlCache.get(videoId);
   if (entry && Date.now() < entry.expiresAt) return entry.url;
-  urlCache.delete(videoId);
+  if (entry) {
+    urlCache.delete(videoId);
+    prisma.urlCache.delete({ where: { videoId } }).catch(() => {});
+  }
   return null;
 }
 
-function runYtdlp(videoId) {
-  return new Promise((resolve, reject) => {
-    function attempt(isRetry) {
-      refreshCookiesTmp();
-      execFile(
-        YT_DLP,
-        [
-          '--get-url',
-          '--format', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
-          '--no-playlist',
-          '--cookies', COOKIES_TMP,
-          '--js-runtimes', `node:${process.env.NODE_PATH || '/home/ubuntu/.nvm/versions/node/v22.22.0/bin/node'}`,
-          `https://www.youtube.com/watch?v=${videoId}`,
-        ],
-        { timeout: 15000 },
-        (err, stdout, stderr) => {
-          if (err) {
-            const is429 = stderr.includes('429') || stderr.includes('Sign in to confirm');
-            if (is429 && !isRetry) {
-              // Reject with retriable marker — resolveUrl will re-queue after backoff
-              return reject(Object.assign(new Error('429'), { retriable: true }));
-            }
-            return reject(err);
-          }
-          const audioUrl = stdout.trim().split('\n')[0];
-          if (!audioUrl) return reject(new Error('yt-dlp returned no URL'));
-          urlCache.set(videoId, { url: audioUrl, expiresAt: Date.now() + URL_CACHE_TTL });
-          resolve(audioUrl);
-        }
-      );
+// Restore valid URL cache entries from DB on startup
+(async () => {
+  try {
+    const entries = await prisma.urlCache.findMany({ where: { expiresAt: { gt: new Date() } } });
+    for (const e of entries) urlCache.set(e.videoId, { url: e.url, expiresAt: e.expiresAt.getTime() });
+    if (entries.length) console.log(`[cache] restored ${entries.length} URLs from DB`);
+  } catch (err) {
+    console.error('[cache] DB restore failed:', err.message);
+  }
+})();
+
+// Purge expired entries from DB once a day
+setInterval(async () => {
+  try {
+    const { count } = await prisma.urlCache.deleteMany({ where: { expiresAt: { lt: new Date() } } });
+    if (count) console.log(`[cache] purged ${count} expired URL entries from DB`);
+  } catch (err) {
+    console.error('[cache] DB purge failed:', err.message);
+  }
+}, 24 * 60 * 60 * 1000);
+
+async function runYtdlp(videoId) {
+  refreshCookiesTmp(); // ensure worker reads fresh cookies
+  let res;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      res = await fetch(`http://127.0.0.1:${YTDLP_PORT}/audio/${videoId}`, { signal: AbortSignal.timeout(15000) });
+      break;
+    } catch (err) {
+      if (err.cause?.code === 'ECONNREFUSED' && attempt < 9) {
+        if (attempt === 0) console.warn('[ytdlp] worker not ready, retrying...');
+        await sleep(500);
+      } else {
+        throw err;
+      }
     }
-    attempt(false);
-  });
+  }
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    const msg = data.error || 'ytdlp worker error';
+    const is429 = msg.includes('429') || msg.includes('Sign in to confirm');
+    if (is429) throw Object.assign(new Error('429'), { retriable: true });
+    const isPermanent = msg.includes('Requested format is not available');
+    if (isPermanent) throw Object.assign(new Error(msg), { permanent: true });
+    throw new Error(msg);
+  }
+  let expiresAt;
+  try {
+    const expireParam = new URL(data.url).searchParams.get('expire');
+    if (!expireParam) {
+      console.warn(`[cache] no expire= param in CDN URL for ${videoId} — using fallback TTL`);
+      expiresAt = Date.now() + 5.5 * 3600 * 1000;
+    } else {
+      expiresAt = Number(expireParam) * 1000 - 5 * 60 * 1000; // 5-min buffer before actual expiry
+    }
+  } catch (_) {
+    expiresAt = Date.now() + 5.5 * 3600 * 1000;
+  }
+  urlCache.set(videoId, { url: data.url, expiresAt });
+  prisma.urlCache.upsert({
+    where: { videoId },
+    create: { videoId, url: data.url, expiresAt: new Date(expiresAt) },
+    update: { url: data.url, expiresAt: new Date(expiresAt) },
+  }).catch((err) => console.error(`[cache] DB write failed for ${videoId}:`, err.message));
+  return data.url;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -108,9 +146,33 @@ function refreshCookiesWithCamoufox() {
   return cookieRefreshPromise;
 }
 
+function autoBlacklist(videoId) {
+  prisma.track.findFirst({ where: { videoId }, select: { id: true } })
+    .then((track) => {
+      if (!track) return;
+      console.log(`[audio] auto-blacklisting ${videoId} (track ${track.id}) — no playable formats`);
+      return prisma.$transaction([
+        prisma.videoBlacklist.upsert({
+          where: { trackId_videoId: { trackId: track.id, videoId } },
+          create: { trackId: track.id, videoId, reason: 'format_unavailable' },
+          update: { reason: 'format_unavailable' },
+        }),
+        prisma.track.update({
+          where: { id: track.id },
+          data: { bugged: true, allSourcesTried: false, searchMode: 'default' },
+        }),
+      ]);
+    })
+    .catch((err) => console.error(`[audio] auto-blacklist failed for ${videoId}:`, err.message));
+}
+
 function resolveUrl(videoId) {
   const cached = getCachedUrl(videoId);
   if (cached) return Promise.resolve(cached);
+
+  if (permanentlyFailed.has(videoId)) {
+    return Promise.reject(new Error(`${videoId}: no playable formats (permanently failed)`));
+  }
 
   if (pendingResolves.has(videoId)) {
     console.log(`[resolve] ${videoId} already in flight — reusing promise`);
@@ -129,11 +191,17 @@ function resolveUrl(videoId) {
         console.log('[cookies] proactive refresh — cookies stale, refreshing before yt-dlp...');
         await refreshCookiesWithCamoufox();
       }
-      await sleep(1500);
+      const gap = Date.now() - lastYtdlpAt;
+      const waitMs = Math.max(0, 1500 - gap);
+      if (waitMs > 0) await sleep(waitMs);
+      lastYtdlpAt = Date.now();
       try {
         return await runYtdlp(videoId);
       } catch (err) {
-        if (err.retriable) {
+        if (err.permanent) {
+          permanentlyFailed.add(videoId);
+          autoBlacklist(videoId);
+        } else if (err.retriable) {
           console.warn(`[audio] 429 for ${videoId} — refreshing cookies then retrying...`);
           await refreshCookiesWithCamoufox();
           await sleep(1500);
@@ -281,7 +349,9 @@ async function searchAllSources(track, artist, targetMs, trackId, blacklistedIds
     return sa - sb;
   });
 
-  return candidates[0];
+  // Filter out videos that failed permanently while this search was in flight
+  const valid = candidates.filter(c => !permanentlyFailed.has(c.videoId));
+  return valid[0] ?? null;
 }
 
 // GET /youtube/search?track=...&artist=...&duration_ms=...&track_id=...
@@ -307,10 +377,14 @@ router.get('/search', async (req, res) => {
       }
 
       const blacklistedIds = new Set(cached.blacklist.map((b) => b.videoId));
+      if (req.query.blacklist) {
+        String(req.query.blacklist).split(',').forEach((id) => blacklistedIds.add(id));
+      }
 
-      // Cache hit — not blacklisted and no re-search pending
-      if (!blacklistedIds.has(cached.videoId) && cached.searchMode !== 'prefer_duration') {
+      // Cache hit — not blacklisted, not permanently failed, and no re-search pending
+      if (!blacklistedIds.has(cached.videoId) && !permanentlyFailed.has(cached.videoId) && cached.searchMode !== 'prefer_duration') {
         console.log(`[search] cache hit for ${track_id}`);
+        if (!getCachedUrl(cached.videoId)) resolveUrl(cached.videoId).catch(() => {});
         // Backfill missing metadata in background
         if (!cached.ytTitle || !cached.track || !cached.artist) {
           const metaUpdate = {};
@@ -341,20 +415,23 @@ router.get('/search', async (req, res) => {
       console.log(`[search] re-search for ${track_id} (reason=${reason})`);
 
       const winner = await searchAllSources(track, artist, targetMs, track_id, blacklistedIds);
-      if (winner) {
-        console.log(`[search] re-search winner for ${track_id} → ${winner.videoId} (${winner.source})`);
+      // Belt-and-suspenders: reject winner if it became permanently failed while search was in flight
+      const validWinner = winner && !permanentlyFailed.has(winner.videoId) ? winner : null;
+      if (validWinner) {
+        console.log(`[search] re-search winner for ${track_id} → ${validWinner.videoId} (${validWinner.source})`);
+        if (!getCachedUrl(validWinner.videoId)) resolveUrl(validWinner.videoId).catch(() => {});
         await prisma.track.update({
           where: { id: track_id },
           data: {
-            videoId: winner.videoId,
-            ...(winner.title ? { ytTitle: winner.title } : {}),
-            source: winner.source,
+            videoId: validWinner.videoId,
+            ...(validWinner.title ? { ytTitle: validWinner.title } : {}),
+            source: validWinner.source,
             searchMode: 'default',
             not_ideal: false,
             bugged: false,
           },
         });
-        return res.json({ videoId: winner.videoId, allSourcesTried: false });
+        return res.json({ videoId: validWinner.videoId, allSourcesTried: false });
       }
 
       console.log(`[search] all sources exhausted for ${track_id}`);
@@ -367,12 +444,17 @@ router.get('/search', async (req, res) => {
   }
 
   // First-time search
-  const winner = await searchAllSources(track, artist, targetMs, track_id ?? null);
+  const blacklistedIds = new Set();
+  if (req.query.blacklist) {
+    String(req.query.blacklist).split(',').forEach((id) => blacklistedIds.add(id));
+  }
+  const winner = await searchAllSources(track, artist, targetMs, track_id ?? null, blacklistedIds);
   if (!winner) {
     return res.json({ videoId: null, allSourcesTried: false });
   }
 
   console.log(`[search] first-time winner for ${track_id ?? '(no id)'} → ${winner.videoId} (${winner.source})`);
+  if (!getCachedUrl(winner.videoId)) resolveUrl(winner.videoId).catch(() => {});
 
   if (track_id) {
     await prisma.track.upsert({
@@ -443,12 +525,19 @@ router.get('/prefetch/:videoId', (req, res) => {
 });
 
 // GET /youtube/audio/:videoId — zwraca 302 do CDN (z cache lub przez yt-dlp)
+// ?fresh=1 — pomija cache i wymusza nowe wywołanie yt-dlp (używane przez frontend po 403)
 router.get('/audio/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const cached = getCachedUrl(videoId);
-  if (cached) {
-    console.log(`[audio] ${videoId} → cache hit`);
-    return res.redirect(302, cached);
+  if (req.query.fresh !== '1') {
+    const cached = getCachedUrl(videoId);
+    if (cached) {
+      console.log(`[audio] ${videoId} → cache hit`);
+      return res.redirect(302, cached);
+    }
+  } else {
+    urlCache.delete(videoId);
+    prisma.urlCache.delete({ where: { videoId } }).catch(() => {});
+    console.log(`[audio] ${videoId} → force refresh`);
   }
   console.log(`[audio] ${videoId} → resolving via yt-dlp`);
   try {
@@ -459,5 +548,47 @@ router.get('/audio/:videoId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// --- Cache warming ---
+
+async function warmTopTracks() {
+  if (pendingResolves.size > 0) { console.log('[cache-warm] skipping — resolves in flight'); return; }
+  const since = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  try {
+    const topEvents = await prisma.userEvent.groupBy({
+      by: ['trackId'],
+      where: { trackId: { not: null }, createdAt: { gte: since } },
+      _count: { trackId: true },
+      orderBy: { _count: { trackId: 'desc' } },
+      take: 20,
+    });
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+    const trackIds = topEvents.map((e) => e.trackId).filter(Boolean);
+    const tracks = await prisma.track.findMany({
+      where: { id: { in: trackIds } },
+      select: { id: true, videoId: true },
+    });
+    const toWarm = tracks
+      .map((t) => t.videoId)
+      .filter((videoId) => {
+        if (!videoId) return false;
+        const entry = urlCache.get(videoId);
+        return !entry || entry.expiresAt - Date.now() < ONE_HOUR_MS;
+      });
+    if (toWarm.length) console.log(`[cache-warm] warming ${toWarm.length} URLs`);
+    toWarm.forEach((videoId, i) => {
+      setTimeout(
+        () => resolveUrl(videoId).catch((err) => console.error(`[cache-warm] ${videoId} failed:`, err.message)),
+        i * 2000
+      );
+    });
+  } catch (err) {
+    console.error('[cache-warm] error:', err.message);
+  }
+}
+
+// First run after 60s (lets ytdlp worker start), then every 30 min
+setTimeout(warmTopTracks, 60 * 1000);
+setInterval(warmTopTracks, 30 * 60 * 1000);
 
 module.exports = router;

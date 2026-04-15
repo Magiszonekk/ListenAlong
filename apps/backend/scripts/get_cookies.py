@@ -74,9 +74,8 @@ def to_netscape(cookies):
     return ''.join(lines)
 
 
-def is_logged_in(ctx):
-    """Check if context has an authenticated YouTube/Google session."""
-    cookies = ctx.cookies()
+def is_logged_in(cookies):
+    """Check if a list of cookies represents an authenticated YouTube/Google session."""
     for c in cookies:
         domain = c.get('domain', '')
         val = c['value']
@@ -137,7 +136,7 @@ def do_google_login(page, ctx):
             'google.com' in url and 'signin' not in url and 'accounts' not in url
         ):
             break
-        if is_logged_in(ctx):
+        if is_logged_in(ctx.cookies()):
             break
         # Check for 2FA input (SMS code or TOTP)
         if page.query_selector('input[type="tel"], input[aria-label*="code" i], input[aria-label*="kod" i]'):
@@ -149,7 +148,7 @@ def do_google_login(page, ctx):
         print('[camoufox] login timed out after 90s', file=sys.stderr)
         return False
 
-    logged = is_logged_in(ctx)
+    logged = is_logged_in(ctx.cookies())
     print(f'[camoufox] login {"succeeded" if logged else "failed — still anonymous"}', file=sys.stderr)
     if not logged:
         _screenshot(page, 'login_failed')
@@ -187,7 +186,7 @@ with Camoufox(headless=False) as browser:
     page.wait_for_timeout(3000)
 
     # If still anonymous and we have credentials — attempt login
-    if not is_logged_in(ctx) and GOOGLE_EMAIL and GOOGLE_PASSWORD:
+    if not is_logged_in(ctx.cookies()) and GOOGLE_EMAIL and GOOGLE_PASSWORD:
         print('[camoufox] anonymous session detected — attempting login...', file=sys.stderr)
         if do_google_login(page, ctx):
             # Return to YouTube after login to collect YouTube-specific cookies
@@ -200,7 +199,7 @@ with Camoufox(headless=False) as browser:
 
 # Safety check — never overwrite with fewer cookies than we started with
 # (unless we successfully logged in, in which case new cookies are authoritative)
-if existing and len(cookies) < len(existing) and not is_logged_in({'cookies': lambda: cookies}):
+if existing and len(cookies) < len(existing) and not is_logged_in(cookies):
     print(
         f'[camoufox] WARNING: got {len(cookies)} cookies vs {len(existing)} original — '
         'keeping original (anonymous session, no credentials)',

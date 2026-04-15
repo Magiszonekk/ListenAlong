@@ -17,8 +17,8 @@ export default defineConfig({
       '/spotify': 'http://localhost:3005',
       '/youtube': 'http://localhost:3005',
       '/log': 'http://localhost:3005',
-      '/clients': 'http://localhost:3005',
       '/callback': 'http://localhost:3005',
+      '/ws': { target: 'ws://localhost:3005', ws: true, rewriteWsOrigin: true },
     },
   },
 })

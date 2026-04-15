@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Bug } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AudioPlayer } from '@/components/AudioPlayer';
@@ -24,7 +25,14 @@ export default function App() {
     feedbackMsg,
     markNotIdeal,
     markBugged,
+    isDev,
+    forceSync,
+    getPlayerProgress,
+    getSpotifyProgress,
+    setCompensationMs,
   } = useSpotifySync();
+
+  const [compensation, setCompensation] = useState(() => localStorage.getItem('syncCompensation') ?? '0');
 
   const listenersText =
     listenerCount === null ? '' :
@@ -107,6 +115,52 @@ export default function App() {
           )}
           {trackAllSourcesTried && (
             <p className="text-xs text-neutral-500 text-center">Sprawdzono wszystkie źródła — brak lepszej wersji.</p>
+          )}
+          {isDev && (
+            <div className="mt-2 border border-neutral-700 rounded-lg p-3 text-xs text-neutral-400 space-y-2 w-64">
+              <div className="text-neutral-600 font-mono uppercase tracking-widest text-[10px]">dev</div>
+              <div className="flex gap-2 flex-wrap">
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    value={compensation}
+                    onChange={e => { setCompensation(e.target.value); setCompensationMs(parseFloat(e.target.value) || 0); }}
+                    className="bg-neutral-900 border border-neutral-700 text-neutral-300 rounded px-2 py-1 font-mono w-20 text-xs"
+                    placeholder="ms"
+                  />
+                  <span className="text-neutral-600 text-[10px]">ms</span>
+                </div>
+                <button
+                  onClick={() => { forceSync(); console.log(`[dev] force sync compensation=${compensation}ms`); }}
+                  className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 font-mono"
+                >
+                  Force Sync
+                </button>
+                <button
+                  onClick={() => console.log(`[dev] player: ${getPlayerProgress().toFixed(3)}s`)}
+                  className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 font-mono"
+                >
+                  Player progress
+                </button>
+                <button
+                  onClick={() => console.log(`[dev] spotify: ${getSpotifyProgress().toFixed(3)}s`)}
+                  className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 font-mono"
+                >
+                  Spotify progress
+                </button>
+                <button
+                  onClick={() => {
+                    const player = getPlayerProgress();
+                    const spotify = getSpotifyProgress();
+                    const diff = player - spotify;
+                    console.log(`[dev] compare — player: ${player.toFixed(3)}s | spotify: ${spotify.toFixed(3)}s | diff: ${diff > 0 ? '+' : ''}${diff.toFixed(3)}s`);
+                  }}
+                  className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 font-mono"
+                >
+                  Compare
+                </button>
+              </div>
+            </div>
           )}
         </div>
       )}

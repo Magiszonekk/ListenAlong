@@ -7,7 +7,8 @@ declare const config: {
   };
   polling: {
     spotifyMs: number;
-    listenersMs: number;
+    driftFactor: number;
+    driftBaseMs: number;
   };
 };
 

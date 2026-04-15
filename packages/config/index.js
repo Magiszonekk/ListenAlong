@@ -15,9 +15,11 @@ module.exports = {
     scriptBonus: envNum('SCRIPT_BONUS_MS', 10_000),
   },
   polling: {
-    // Jak często odpytywać /spotify/now-playing (ms)
+    // Jak często serwer odpytuje Spotify (ms) i pushuje stan przez WebSocket
     spotifyMs: envNum('SPOTIFY_POLL_MS', 3_000),
-    // Jak często odpytywać /clients dla liczby słuchaczy (ms)
-    listenersMs: envNum('LISTENERS_POLL_MS', 20_000),
+    // Próg driftu progress_ms powyżej którego serwer wysyła broadcast (seek, buffering itp.)
+    // Broadcast jest pomijany gdy |actual - expected| <= spotifyMs * driftFactor + driftBaseMs
+    driftFactor: envNum('DRIFT_FACTOR_PCT', 15) / 100,
+    driftBaseMs: envNum('DRIFT_BASE_MS', 1_000),
   },
 };

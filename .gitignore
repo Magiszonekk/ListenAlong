@@ -6,3 +6,4 @@ cookies_tmp.txt
 .env
 data.db
 **/data.db
+tokens.json
