@@ -34,13 +34,41 @@ export default function App() {
 
   const [compensation, setCompensation] = useState(() => localStorage.getItem('syncCompensation') ?? '0');
 
+  const [, setClickCount] = useState(0);
+  const [lastClickTime, setLastClickTime] = useState(0);
+
+  const handleSecretClick = () => {
+    const now = Date.now();
+
+    // jeśli przerwa za duża → reset
+    if (now - lastClickTime > 1500) {
+      setClickCount(1);
+    } else {
+      setClickCount(prev => {
+        const newCount = prev + 1;
+        console.log(`[dev] clicks: ${newCount}/5`);
+        if (newCount === 4) console.log("[dev] almost there...");
+        if (newCount >= 5) {
+          localStorage.setItem("dev", "true");
+          console.log("[dev] enabled 😎");
+          window.location.reload(); // żeby hook złapał zmianę
+          return 0;
+        }
+
+        return newCount;
+      });
+    }
+
+    setLastClickTime(now);
+  };
+
   const listenersText =
     listenerCount === null ? '' :
     listenerCount === 1 ? '1 listener' : `${listenerCount} listeners`;
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white flex flex-col items-center justify-center gap-4 p-6">
-      <h1 className="text-2xl font-bold text-[#1db954]">ListenAlong</h1>
+      <h1 onClick={handleSecretClick} className="text-2xl font-bold text-[#1db954] cursor-pointer">ListenAlong</h1>
 
       {listenersText && (
         <div className="relative group cursor-default">

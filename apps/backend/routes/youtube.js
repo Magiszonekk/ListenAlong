@@ -32,8 +32,88 @@ const pendingResolves = new Map(); // videoId → Promise (dedup same-video call
 const permanentlyFailed = new Set(); // videoId → no audio formats (cleared on restart)
 const COOKIE_REFRESH_INTERVAL = 25 * 60 * 1000; // 25 minut
 
-// Serialize all yt-dlp calls — YouTube rate-limits bursts from one IP
-let ytdlpQueue = Promise.resolve();
+// Priority levels for URL resolution
+const PRIO = { DIRECT: 0, PREFETCH: 1, WARM: 2 };
+
+// Priority queue for yt-dlp calls.
+// Items with lower priority value run first (DIRECT=0 > PREFETCH=1 > WARM=2).
+// A higher-priority item preempts the running item by aborting its AbortController —
+// Python's ThreadingHTTPServer handles the in-flight request to completion in its own
+// thread while Node immediately starts the higher-priority item.
+class YtdlpQueue {
+  #queue = [];    // { videoId, priority, ac, workFn, resolve, reject }
+  #active = null; // currently executing item
+  #running = false;
+
+  enqueue(videoId, priority, workFn) {
+    const ac = new AbortController();
+    let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    const item = { videoId, priority, ac, workFn, resolve, reject };
+
+    const insertAt = this.#queue.findIndex(i => i.priority > priority);
+    if (insertAt === -1) this.#queue.push(item);
+    else this.#queue.splice(insertAt, 0, item);
+
+    // Preempt if new item outranks the running one
+    if (this.#active && priority < this.#active.priority) {
+      console.log(`[queue] preempting ${this.#active.videoId} (prio=${this.#active.priority}) for ${videoId} (prio=${priority})`);
+      this.#active.ac.abort();
+    }
+
+    this.#maybeRun();
+    return promise;
+  }
+
+  // Promote a queued or active item to a higher priority (lower number)
+  promote(videoId, priority) {
+    if (this.#active?.videoId === videoId && priority < this.#active.priority) {
+      this.#active.priority = priority;
+    }
+    const item = this.#queue.find(i => i.videoId === videoId);
+    if (item && priority < item.priority) {
+      item.priority = priority;
+      this.#queue.sort((a, b) => a.priority - b.priority);
+    }
+  }
+
+  // Cancel a queued or active item (e.g. HTTP client disconnected)
+  cancel(videoId) {
+    const idx = this.#queue.findIndex(i => i.videoId === videoId);
+    if (idx !== -1) {
+      const [item] = this.#queue.splice(idx, 1);
+      item.reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+      return;
+    }
+    if (this.#active?.videoId === videoId) this.#active.ac.abort();
+  }
+
+  #maybeRun() {
+    if (!this.#running && this.#queue.length > 0) this.#run();
+  }
+
+  async #run() {
+    this.#running = true;
+    while (this.#queue.length > 0) {
+      const item = this.#queue.shift();
+      if (item.ac.signal.aborted) {
+        item.reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+        continue;
+      }
+      this.#active = item;
+      try {
+        item.resolve(await item.workFn(item.ac.signal));
+      } catch (err) {
+        item.reject(err);
+      } finally {
+        this.#active = null;
+      }
+    }
+    this.#running = false;
+  }
+}
+
+const ytdlpQueue = new YtdlpQueue();
 let lastYtdlpAt = 0; // timestamp of last yt-dlp start — throttle only consecutive calls
 
 const YTDLP_PORT = process.env.YTDLP_SERVER_PORT || 9091;
@@ -121,10 +201,9 @@ async function warmUrlCache() {
                 bugged: false,
               },
             });
-            await ytdlpQueue;
             if (!getCachedUrl(valid.videoId)) {
               try {
-                await resolveUrl(valid.videoId);
+                await resolveUrl(valid.videoId, PRIO.WARM);
                 console.log(`[warmer] warmed ${valid.videoId} (re-search)`);
               } catch (err) {
                 console.warn(`[warmer] failed to warm ${valid.videoId}: ${err.message}`);
@@ -154,10 +233,9 @@ async function warmUrlCache() {
     console.log(`[warmer] refreshing ${stale.length} stale URLs...`);
 
     for (const track of stale) {
-      await ytdlpQueue;
       if (getCachedUrl(track.videoId)) continue;
       try {
-        await resolveUrl(track.videoId);
+        await resolveUrl(track.videoId, PRIO.WARM);
         console.log(`[warmer] warmed ${track.videoId}`);
       } catch (err) {
         console.warn(`[warmer] failed ${track.videoId}: ${err.message}`);
@@ -168,17 +246,22 @@ async function warmUrlCache() {
   }
 }
 
-setTimeout(() => warmUrlCache(), 60_000);
-setInterval(() => warmUrlCache(), 4 * 60 * 60 * 1000);
+if (cacheConfig.warmEnabled) {
+  setTimeout(() => warmUrlCache(), 60_000);
+  setInterval(() => warmUrlCache(), 4 * 60 * 60 * 1000);
+}
 
-async function runYtdlp(videoId) {
+async function runYtdlp(videoId, signal) {
   refreshCookiesTmp(); // ensure worker reads fresh cookies
   let res;
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
-      res = await fetch(`http://127.0.0.1:${YTDLP_PORT}/audio/${videoId}`, { signal: AbortSignal.timeout(15000) });
+      const timeoutSignal = AbortSignal.timeout(15000);
+      const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
+      res = await fetch(`http://127.0.0.1:${YTDLP_PORT}/audio/${videoId}`, { signal: combinedSignal });
       break;
     } catch (err) {
+      if (signal?.aborted) throw err; // don't retry if preempted/cancelled
       if (err.cause?.code === 'ECONNREFUSED' && attempt < 9) {
         if (attempt === 0) console.warn('[ytdlp] worker not ready, retrying...');
         await sleep(500);
@@ -264,7 +347,7 @@ function autoBlacklist(videoId) {
     .catch((err) => console.error(`[audio] auto-blacklist failed for ${videoId}:`, err.message));
 }
 
-function resolveUrl(videoId) {
+function resolveUrl(videoId, priority = PRIO.DIRECT) {
   const cached = getCachedUrl(videoId);
   if (cached) return Promise.resolve(cached);
 
@@ -274,43 +357,46 @@ function resolveUrl(videoId) {
 
   if (pendingResolves.has(videoId)) {
     console.log(`[resolve] ${videoId} already in flight — reusing promise`);
+    ytdlpQueue.promote(videoId, priority);
     return pendingResolves.get(videoId);
   }
 
-  // Chain onto the serialized queue — only one yt-dlp at a time.
-  // pendingResolves entry stays alive through the entire retry cycle so
-  // concurrent requests for the same videoId always reuse this promise.
-  const promise = ytdlpQueue
-    .then(async () => {
-      const cached2 = getCachedUrl(videoId);
-      if (cached2) return cached2;
-      // Proactive cookie refresh — if cookies are stale, refresh before yt-dlp
-      if (Date.now() - lastCookieRefreshAt > COOKIE_REFRESH_INTERVAL) {
-        console.log('[cookies] proactive refresh — cookies stale, refreshing before yt-dlp...');
+  // Work function executed inside the priority queue — runs after higher-priority items.
+  // pendingResolves entry stays alive through the entire retry cycle so concurrent
+  // requests for the same videoId always reuse this promise.
+  const workFn = async (signal) => {
+    const cached2 = getCachedUrl(videoId);
+    if (cached2) return cached2;
+    // Proactive cookie refresh — if cookies are stale, refresh before yt-dlp
+    if (Date.now() - lastCookieRefreshAt > COOKIE_REFRESH_INTERVAL) {
+      console.log('[cookies] proactive refresh — cookies stale, refreshing before yt-dlp...');
+      await refreshCookiesWithCamoufox();
+    }
+    if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+    const gap = Date.now() - lastYtdlpAt;
+    const waitMs = Math.max(0, 1500 - gap);
+    if (waitMs > 0) await sleep(waitMs);
+    lastYtdlpAt = Date.now();
+    try {
+      return await runYtdlp(videoId, signal);
+    } catch (err) {
+      if (err.permanent) {
+        permanentlyFailed.add(videoId);
+        autoBlacklist(videoId);
+      } else if (err.retriable) {
+        console.warn(`[audio] 429 for ${videoId} — refreshing cookies then retrying...`);
         await refreshCookiesWithCamoufox();
+        if (signal.aborted) throw err;
+        await sleep(1500);
+        return runYtdlp(videoId, signal); // one retry — pendingResolves stays valid
       }
-      const gap = Date.now() - lastYtdlpAt;
-      const waitMs = Math.max(0, 1500 - gap);
-      if (waitMs > 0) await sleep(waitMs);
-      lastYtdlpAt = Date.now();
-      try {
-        return await runYtdlp(videoId);
-      } catch (err) {
-        if (err.permanent) {
-          permanentlyFailed.add(videoId);
-          autoBlacklist(videoId);
-        } else if (err.retriable) {
-          console.warn(`[audio] 429 for ${videoId} — refreshing cookies then retrying...`);
-          await refreshCookiesWithCamoufox();
-          await sleep(1500);
-          return runYtdlp(videoId); // one retry, inline — pendingResolves stays valid
-        }
-        throw err;
-      }
-    })
+      throw err;
+    }
+  };
+
+  const promise = ytdlpQueue.enqueue(videoId, priority, workFn)
     .finally(() => pendingResolves.delete(videoId));
 
-  ytdlpQueue = promise.catch(() => {});
   pendingResolves.set(videoId, promise);
   return promise;
 }
@@ -482,7 +568,7 @@ router.get('/search', async (req, res) => {
       // Cache hit — not blacklisted, not permanently failed, and no re-search pending
       if (!blacklistedIds.has(cached.videoId) && !permanentlyFailed.has(cached.videoId) && cached.searchMode !== 'prefer_duration') {
         console.log(`[search] cache hit for ${track_id}`);
-        if (!getCachedUrl(cached.videoId)) resolveUrl(cached.videoId).catch(() => {});
+        if (!getCachedUrl(cached.videoId)) resolveUrl(cached.videoId, PRIO.PREFETCH).catch(() => {});
         // Backfill missing metadata in background
         if (!cached.ytTitle || !cached.track || !cached.artist) {
           const metaUpdate = {};
@@ -517,7 +603,7 @@ router.get('/search', async (req, res) => {
       const validWinner = winner && !permanentlyFailed.has(winner.videoId) ? winner : null;
       if (validWinner) {
         console.log(`[search] re-search winner for ${track_id} → ${validWinner.videoId} (${validWinner.source})`);
-        if (!getCachedUrl(validWinner.videoId)) resolveUrl(validWinner.videoId).catch(() => {});
+        if (!getCachedUrl(validWinner.videoId)) resolveUrl(validWinner.videoId, PRIO.PREFETCH).catch(() => {});
         await prisma.track.update({
           where: { id: track_id },
           data: {
@@ -553,7 +639,7 @@ router.get('/search', async (req, res) => {
   }
 
   console.log(`[search] first-time winner for ${track_id ?? '(no id)'} → ${winner.videoId} (${winner.source})`);
-  if (!getCachedUrl(winner.videoId)) resolveUrl(winner.videoId).catch(() => {});
+  if (!getCachedUrl(winner.videoId)) resolveUrl(winner.videoId, PRIO.PREFETCH).catch(() => {});
 
   if (track_id) {
     await prisma.track.upsert({
@@ -618,7 +704,7 @@ router.get('/prefetch/:videoId', (req, res) => {
   }
   res.json({ ok: true, cached: false });
   console.log(`[prefetch] ${videoId} resolving in background...`);
-  resolveUrl(videoId)
+  resolveUrl(videoId, PRIO.PREFETCH)
     .then(() => console.log(`[prefetch] ${videoId} cached OK`))
     .catch((err) => console.error(`[prefetch] ${videoId} failed:`, err.message));
 });
@@ -639,12 +725,22 @@ router.get('/audio/:videoId', async (req, res) => {
     console.log(`[audio] ${videoId} → force refresh`);
   }
   console.log(`[audio] ${videoId} → resolving via yt-dlp`);
+  // Cancel the in-flight resolve if the client disconnects before we respond.
+  // This unblocks the queue for the next (higher-priority) request.
+  let clientGone = false;
+  req.on('close', () => {
+    if (!res.headersSent) {
+      clientGone = true;
+      ytdlpQueue.cancel(videoId);
+    }
+  });
   try {
-    const audioUrl = await resolveUrl(videoId);
-    res.redirect(302, audioUrl);
+    const audioUrl = await resolveUrl(videoId, PRIO.DIRECT);
+    if (!clientGone) res.redirect(302, audioUrl);
   } catch (err) {
+    if (clientGone || err.name === 'AbortError') return;
     console.error(`[audio] yt-dlp error for ${videoId}:`, err.message);
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
@@ -677,7 +773,7 @@ async function warmTopTracks() {
     if (toWarm.length) console.log(`[cache-warm] warming ${toWarm.length} URLs`);
     toWarm.forEach((videoId, i) => {
       setTimeout(
-        () => resolveUrl(videoId).catch((err) => console.error(`[cache-warm] ${videoId} failed:`, err.message)),
+        () => resolveUrl(videoId, PRIO.WARM).catch((err) => console.error(`[cache-warm] ${videoId} failed:`, err.message)),
         i * 2000
       );
     });

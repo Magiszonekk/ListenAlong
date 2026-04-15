@@ -3,9 +3,14 @@
   "version": "1.0.0",
   "type": "commonjs",
   "scripts": {
+    "postinstall": "prisma generate",
+    "prestart": "prisma migrate deploy",
+    "predev": "prisma migrate deploy",
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "studio": "npx prisma studio"
+    "studio": "npx prisma studio",
+    "db:cleanup": "node scripts/db-cleanup.js",
+    "db:cleanup:dry": "node scripts/db-cleanup.js --dry-run"
   },
   "dependencies": {
     "@listenalong/config": "*",

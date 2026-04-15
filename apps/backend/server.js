@@ -8,7 +8,7 @@ const axios = require('axios');
 const { spawn } = require('child_process');
 const { prisma } = require('./lib/db');
 const { getAccessToken } = require('./routes/auth');
-const { polling } = require('@listenalong/config');
+const { polling, cache: cacheConfig } = require('@listenalong/config');
 
 // Start Xvfb for headful Camoufox sessions
 const xvfb = spawn('Xvfb', [':99', '-screen', '0', '1280x720x24'], {
@@ -141,7 +141,7 @@ wss.on('connection', (ws) => {
         ...lastState,
         serverAge: lastBroadcastAt ? Date.now() - lastBroadcastAt : 0,
       }));
-      if (lastQueue !== undefined) ws.send(JSON.stringify({ type: 'queue', next: lastQueue }));
+      if (lastQueue !== undefined) ws.send(JSON.stringify(queueMsg(lastQueue)));
     }
 
     if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong', ts: msg.ts }));
@@ -183,14 +183,20 @@ async function fetchQueue() {
     headers: { Authorization: `Bearer ${token}` },
     validateStatus: (s) => s < 500,
   });
-  if (r.status !== 200 || !r.data?.queue?.length) return null;
-  const q = r.data.queue[0];
-  return {
+  if (r.status !== 200 || !r.data?.queue?.length) return [];
+  return r.data.queue.slice(0, cacheConfig.prefetchAhead).map((q) => ({
     track_id: q.id,
     track: q.name,
     artist: q.artists.map((a) => a.name).join(', '),
     duration_ms: q.duration_ms,
-  };
+  }));
+}
+
+// Build a 'queue' WS message from the fetched track list.
+// tracks[0] = next (full audio prefetch), tracks[1..] = upcoming (URL-only prefetch).
+function queueMsg(tracks) {
+  if (!tracks) return { type: 'queue', next: null, upcoming: [] };
+  return { type: 'queue', next: tracks[0] ?? null, upcoming: tracks.slice(1) };
 }
 
 function stateChanged(a, b) {
@@ -222,7 +228,7 @@ async function spotifyPollTick() {
         lastTrackId = state.track_id;
         const next = await fetchQueue();
         lastQueue = next;
-        broadcastAll({ type: 'queue', next });
+        broadcastAll(queueMsg(next));
 
         // Refresh queue after 30s so prefetch is up-to-date before track ends.
         // Guard: if track changes before timeout fires, skip stale refresh.
@@ -230,7 +236,7 @@ async function spotifyPollTick() {
         setTimeout(async () => {
           if (lastTrackId !== expectedTrackId) return;
           const next2 = await fetchQueue().catch(() => null);
-          if (next2 !== undefined) { lastQueue = next2; broadcastAll({ type: 'queue', next: next2 }); }
+          if (next2 !== undefined) { lastQueue = next2; broadcastAll(queueMsg(next2)); }
         }, 30000);
       }
     }

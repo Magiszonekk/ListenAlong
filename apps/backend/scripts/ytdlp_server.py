@@ -73,12 +73,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {'error': str(e)})
 
     def _json(self, status, body):
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except BrokenPipeError:
+            pass  # Node.js aborted the request (preemption) — socket already closed
 
 
 if __name__ == '__main__':

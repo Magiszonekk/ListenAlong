@@ -5,19 +5,23 @@ Streams audio synced to whatever is currently playing on Spotify — finds the m
 ## How it works
 
 1. The host authenticates with Spotify via OAuth.
-2. The backend polls Spotify every 3 seconds for the currently playing track.
-3. For each track it resolves a YouTube audio URL (via Odesli or YTMusic search + yt-dlp).
-4. All listeners receive the same audio stream, synced to Spotify's playback position.
+2. The backend polls Spotify every second for the currently playing track and progress.
+3. State is broadcast to all connected clients over WebSocket.
+4. When a new track starts, the backend resolves a YouTube audio URL (via Odesli mapping and/or YTMusic search + yt-dlp) and caches it.
+5. Upcoming tracks are prefetched in the background so the transition is seamless:
+   - **N+1** — CDN URL resolved + audio buffered in the browser.
+   - **N+2 … N+`PREFETCH_AHEAD`** — CDN URL resolved only (no audio element).
+6. All listeners play from the same YouTube CDN URL, seeked to Spotify's current position.
 
 ---
 
 ## Prerequisites
 
-- **Node.js** v18+
+- **Node.js** v20+
 - **Python 3.9+**
-- **yt-dlp** — install via `pip install yt-dlp` or your package manager, expected at `/usr/local/bin/yt-dlp` (override with `YT_DLP_PATH` env var)
-- **Camoufox** — headful browser used to refresh YouTube cookies: `pip install camoufox && python3 -m camoufox fetch`
-- **Xvfb** — virtual display for headful Camoufox on servers: `apt install xvfb`
+- **yt-dlp** binary at `/usr/local/bin/yt-dlp` — install via `pip install yt-dlp` or download from the yt-dlp releases page
+- **Camoufox** — headful browser used to refresh YouTube cookies automatically: `pip install camoufox && python3 -m camoufox fetch`
+- **Xvfb** — virtual display for headless servers: `apt install xvfb`
 
 ---
 
@@ -25,20 +29,20 @@ Streams audio synced to whatever is currently playing on Spotify — finds the m
 
 ### 1. Environment variables
 
-Copy the example file and fill in the values:
-
 ```bash
 cp example.env .env
 ```
 
-| Variable | Description |
-|---|---|
-| `PORT` | Port the server listens on (default `3000`) |
-| `SPOTIFY_CLIENT_ID` | From your Spotify Developer app |
-| `SPOTIFY_CLIENT_SECRET` | From your Spotify Developer app |
-| `REDIRECT_URI` | Must match exactly what's registered in your Spotify app (e.g. `https://yourdomain.com/callback`) |
-| `GOOGLE_EMAIL` | *(Optional)* Google account email for auto YouTube login |
-| `GOOGLE_PASSWORD` | *(Optional)* Google account password for auto YouTube login |
+Fill in the required values:
+
+| Variable | Required | Description |
+|---|---|---|
+| `PORT` | | Port the server listens on (default `3000`) |
+| `SPOTIFY_CLIENT_ID` | Yes | From your Spotify Developer app |
+| `SPOTIFY_CLIENT_SECRET` | Yes | From your Spotify Developer app |
+| `REDIRECT_URI` | Yes | Must match exactly what's registered in your Spotify app (e.g. `https://yourdomain.com/callback`) |
+| `GOOGLE_EMAIL` | | Google account email for automatic YouTube login |
+| `GOOGLE_PASSWORD` | | Google account password for automatic YouTube login |
 
 ### 2. Spotify app
 
@@ -52,29 +56,24 @@ cp example.env .env
 npm install
 ```
 
-### 4. Initialize the database
+This also generates the Prisma client automatically.
 
-```bash
-cd apps/backend
-npx prisma db push
-```
+### 4. YouTube cookies
 
-This creates `apps/backend/data.db` with all required tables.
-
-### 5. YouTube cookies (initial setup)
-
-yt-dlp needs valid YouTube cookies to resolve audio URLs. Generate them once before first run:
+yt-dlp needs valid YouTube cookies to resolve audio URLs. Generate them before first run:
 
 ```bash
 cd apps/backend
 python3 scripts/get_cookies.py
 ```
 
-If `GOOGLE_EMAIL` and `GOOGLE_PASSWORD` are set in `.env`, the script logs in automatically. Otherwise a browser window opens — log in manually and close it. Cookies are saved to `apps/backend/cookies.txt`.
+If `GOOGLE_EMAIL` and `GOOGLE_PASSWORD` are set, the script logs in automatically. Otherwise a browser window opens for manual login. Cookies are saved to `apps/backend/cookies.txt`.
 
-> The server refreshes cookies automatically every 25 minutes and on 429 errors, so you normally only need to run this once.
+> The server refreshes cookies automatically every 25 minutes and on 429/403 errors via Camoufox — you only need to run this once.
 
-### 6. Build the frontend
+The database (`apps/backend/data.db`) is created automatically on first `npm start` or `npm run dev`.
+
+### 5. Build the frontend
 
 ```bash
 npm run build
@@ -90,7 +89,7 @@ npm run build
 npm start
 ```
 
-Serves the built frontend as static files and starts the API on the configured `PORT`.
+Serves the built frontend as static files and starts the API on `PORT`.
 
 ### Development
 
@@ -98,7 +97,7 @@ Serves the built frontend as static files and starts the API on the configured `
 npm run dev
 ```
 
-Runs the backend with `--watch` and the Vite dev server concurrently. The Vite dev server proxies API requests to the backend.
+Runs the backend with `--watch` and the Vite dev server concurrently. Vite proxies API and WebSocket requests to the backend.
 
 ---
 
@@ -107,15 +106,15 @@ Runs the backend with `--watch` and the Vite dev server concurrently. The Vite d
 ### As the host
 
 1. Open the app in a browser.
-2. Click **Log in with Spotify** and authorize the app.
+2. Click **Log in with Spotify** and authorize.
 3. Start playing something on Spotify.
-4. Click **Start sync** — audio will begin playing synced to your Spotify position. (optional)
-5. You can **Close the website**, backend will be still connected to your spotify and serving music to listeners
+4. Click **Start sync** — audio begins playing synced to your Spotify position.
+5. You can close the browser tab — the backend stays connected to Spotify and keeps serving music to listeners.
 
 ### As a listener
 
-1. Open the app URL in a browser.
-2. Click **Start sync** — audio starts playing synced to whatever the host is playing.
+1. Open the app URL.
+2. Click **Start sync** — audio starts, synced to whatever the host is playing.
 
 ---
 
@@ -123,12 +122,44 @@ Runs the backend with `--watch` and the Vite dev server concurrently. The Vite d
 
 These appear after clicking Start sync:
 
-| Button | When visible | What it does |
-|---|---|---|
-| `~` | Source is Odesli (timing may be off) | Flags the current match as imprecise — on next play it searches for a version with a closer duration |
-| Bug icon | Always | Blacklists the current YouTube video — on next play it finds an entirely different source |
+| Button | What it does |
+|---|---|
+| `~` | Flags the current match as imprecise — on next play the search prefers a version with a closer duration |
+| Bug icon | Blacklists the current YouTube video — on next play an entirely different source is found |
 
 If all alternative sources have been tried, both buttons are disabled and a notice is shown.
+
+---
+
+## Configuration
+
+All variables are optional — defaults are shown. Set them in `.env`.
+
+### Search scoring
+
+| Variable | Default | Description |
+|---|---|---|
+| `YT_SEARCH_COUNT` | `5` | Number of YouTube candidates to fetch and score |
+| `ODESLI_BONUS_MS` | `0` | Score bonus (ms) for Odesli-matched candidates |
+| `TITLE_BONUS_MS` | `15000` | Max score bonus for title/artist word overlap |
+| `SCRIPT_BONUS_MS` | `10000` | Score bonus when track has CJK characters and the YouTube title also does |
+
+### Polling & sync
+
+| Variable | Default | Description |
+|---|---|---|
+| `SPOTIFY_POLL_MS` | `1000` | How often the server polls Spotify and pushes state over WebSocket |
+| `DRIFT_FACTOR_PCT` | `15` | Broadcast is skipped when `|actual − expected| ≤ poll_ms × factor% + base_ms` |
+| `DRIFT_BASE_MS` | `1000` | Base drift tolerance in ms (see above) |
+
+### Prefetch & URL cache
+
+| Variable | Default | Description |
+|---|---|---|
+| `PREFETCH_AHEAD` | `5` | How many upcoming tracks to prefetch CDN URLs for (N+1 also buffers audio, N+2… only resolve URLs) |
+| `WARM_CACHE_ENABLED` | `0` | Set to `1` to enable the background cache warmer |
+| `WARM_CACHE_TOP_N` | `50` | Number of most-played tracks to keep warm |
+| `WARM_CACHE_MIN_TTL_M` | `15` | Refresh a cached URL when fewer than this many minutes remain |
 
 ---
 
@@ -141,15 +172,34 @@ cd apps/backend
 npm run studio
 ```
 
-Tables:
-- **Track** — cached Spotify→YouTube matches with search metadata
-- **VideoBlacklist** — videos flagged as bugged per track
-- **Play** — per-client play history
-- **AuthEvent** — Spotify OAuth login events (IP, user agent)
-- **UserEvent** — client-side events (start, pause, resume, spotify_pause, spotify_play, bug, not_ideal, exit)
+### Tables
+
+| Table | Contents |
+|---|---|
+| `Track` | Cached Spotify→YouTube matches with search metadata |
+| `VideoBlacklist` | Videos flagged as bugged per track |
+| `UrlCache` | Resolved YouTube CDN URLs with expiry timestamps |
+| `Play` | Per-client play history |
+| `AuthEvent` | Spotify OAuth login events (IP, user agent) |
+| `UserEvent` | Client-side events: `start`, `pause`, `resume`, `spotify_pause`, `spotify_play`, `bug`, `not_ideal`, `exit` |
+
+### Cleanup
+
+Remove old records (default: older than 30 days) and expired URL cache entries:
+
+```bash
+# Preview what would be deleted
+npm run db:cleanup:dry
+
+# Delete
+npm run db:cleanup
+
+# Custom retention period
+npm run db:cleanup -- --days=7
+```
 
 ---
 
 ## Logs
 
-Server logs are written to `logs/YYYY-MM-DD.log` and also mirrored to stdout. Frontend debug messages are sent to `POST /log` and appear in the same log file tagged `[frontend]`. User events are tagged `[event]`.
+Server logs are written to `logs/YYYY-MM-DD.log` and mirrored to stdout. Frontend debug messages are posted to `POST /log` and appear in the same file tagged `[frontend]`. User events are tagged `[event]`.

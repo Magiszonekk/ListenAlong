@@ -224,6 +224,24 @@ export function useSpotifySync() {
     } catch (_) {}
   }, []);
 
+  // Resolve CDN URLs for upcoming tracks (N+2, N+3) without audio buffering.
+  // Fires /youtube/search + /youtube/prefetch fire-and-forget for each track sequentially
+  // so the backend UrlCache is warm before those tracks become current.
+  const prefetchUrls = useCallback(async (tracks: QueueTrack[]) => {
+    for (const track of tracks) {
+      try {
+        const res = await fetch(
+          `/youtube/search?track=${encodeURIComponent(track.track)}&artist=${encodeURIComponent(track.artist)}&duration_ms=${track.duration_ms}&track_id=${encodeURIComponent(track.track_id)}`
+        );
+        const data = await res.json();
+        if (data.videoId) {
+          fetch(`/youtube/prefetch/${data.videoId}`);
+          log(`[prefetch] url-only: ${track.track} → ${data.videoId}`);
+        }
+      } catch (_) {}
+    }
+  }, []);
+
   // --- Load track ---
 
   const loadTrack = useCallback(async (data: NowPlaying, spotifySec: number) => {
@@ -486,7 +504,10 @@ export function useSpotifySync() {
         pingMsRef.current = pingMsRef.current === 0 ? rtt : 0.7 * pingMsRef.current + 0.3 * rtt;
         log(`[ping] rtt=${rtt}ms smoothed=${pingMsRef.current.toFixed(1)}ms`);
       }
-      else if (msg.type === 'queue') prefetchNext((msg.next as QueueTrack | null));
+      else if (msg.type === 'queue') {
+        prefetchNext(msg.next as QueueTrack | null);
+        prefetchUrls((msg.upcoming as QueueTrack[]) ?? []);
+      }
       else if (msg.type === 'listeners') {
         setListenerCount(msg.count as number);
         setClientIds((msg.clientIds as string[]) ?? []);

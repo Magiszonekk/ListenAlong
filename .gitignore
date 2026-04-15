@@ -1,7 +1,7 @@
 node_modules
 cookies.txt
 cache.json
-logs
+logs/**
 cookies_tmp.txt
 .env
 data.db

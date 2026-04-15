@@ -12,7 +12,9 @@
   "scripts": {
     "dev": "concurrently \"npm run dev -w backend\" \"npm run dev -w frontend\"",
     "build": "npm run build -w frontend",
-    "start": "npm run start -w backend"
+    "start": "npm run start -w backend",
+    "db:cleanup": "npm run db:cleanup -w backend",
+    "db:cleanup:dry": "npm run db:cleanup:dry -w backend"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
