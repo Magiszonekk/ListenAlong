@@ -22,4 +22,10 @@ module.exports = {
     driftFactor: envNum('DRIFT_FACTOR_PCT', 15) / 100,
     driftBaseMs: envNum('DRIFT_BASE_MS', 1_000),
   },
+  cache: {
+    // Ile najczęściej granych tracków trzymać ciepłych w URL cache
+    warmTopN: envNum('WARM_CACHE_TOP_N', 50),
+    // Odświeżaj URL gdy pozostały TTL < N minut
+    warmMinTtlM: envNum('WARM_CACHE_MIN_TTL_M', 15),
+  },
 };

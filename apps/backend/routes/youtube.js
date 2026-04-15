@@ -1,4 +1,4 @@
-const { search: searchConfig } = require('@listenalong/config');
+const { search: searchConfig, cache: cacheConfig } = require('@listenalong/config');
 const express = require('express');
 const { execFile } = require('child_process');
 const path = require('path');
@@ -72,6 +72,104 @@ setInterval(async () => {
     console.error('[cache] DB purge failed:', err.message);
   }
 }, 24 * 60 * 60 * 1000);
+
+// Pre-warm CDN URL cache for top-N most played tracks.
+// Phase 1: proactively re-search tracks with blacklisted/stale videoIds (bugged or prefer_duration).
+// Phase 2: refresh CDN URLs for clean tracks whose TTL is running low.
+async function warmUrlCache() {
+  try {
+    const topPlays = await prisma.play.groupBy({
+      by: ['trackId'],
+      _count: { trackId: true },
+      orderBy: { _count: { trackId: 'desc' } },
+      take: cacheConfig.warmTopN,
+    });
+    if (!topPlays.length) return;
+
+    const trackIds = topPlays.map(t => t.trackId);
+    const tracks = await prisma.track.findMany({
+      where: { id: { in: trackIds }, allSourcesTried: false },
+      select: {
+        id: true, videoId: true, track: true, artist: true, durationMs: true,
+        searchMode: true, bugged: true,
+        blacklist: { select: { videoId: true } },
+      },
+    });
+
+    const needsResearch = tracks.filter(t => t.bugged || t.searchMode !== 'default');
+    const cleanTracks   = tracks.filter(t => !t.bugged && t.searchMode === 'default');
+
+    // --- Phase 1: proactive re-search for blacklisted / not_ideal tracks ---
+    if (needsResearch.length) {
+      console.log(`[warmer] pre-searching ${needsResearch.length} blacklisted/not_ideal tracks...`);
+      for (const t of needsResearch) {
+        if (!t.track || !t.artist) continue;
+        const blacklistedIds = new Set(t.blacklist.map(b => b.videoId));
+        try {
+          const winner = await searchAllSources(t.track, t.artist, t.durationMs, t.id, blacklistedIds);
+          const valid = winner && !permanentlyFailed.has(winner.videoId) ? winner : null;
+          if (valid) {
+            console.log(`[warmer] re-search winner for ${t.id} → ${valid.videoId} (${valid.source})`);
+            await prisma.track.update({
+              where: { id: t.id },
+              data: {
+                videoId: valid.videoId,
+                ...(valid.title ? { ytTitle: valid.title } : {}),
+                source: valid.source,
+                searchMode: 'default',
+                not_ideal: false,
+                bugged: false,
+              },
+            });
+            await ytdlpQueue;
+            if (!getCachedUrl(valid.videoId)) {
+              try {
+                await resolveUrl(valid.videoId);
+                console.log(`[warmer] warmed ${valid.videoId} (re-search)`);
+              } catch (err) {
+                console.warn(`[warmer] failed to warm ${valid.videoId}: ${err.message}`);
+              }
+            }
+          } else {
+            console.log(`[warmer] re-search no winner for ${t.id} — marking allSourcesTried`);
+            await prisma.track.update({
+              where: { id: t.id },
+              data: { allSourcesTried: true, searchMode: 'default', not_ideal: false, bugged: false },
+            });
+          }
+        } catch (err) {
+          console.warn(`[warmer] re-search failed for ${t.id}: ${err.message}`);
+        }
+      }
+    }
+
+    // --- Phase 2: refresh stale CDN URLs for clean tracks ---
+    const minTtlMs = cacheConfig.warmMinTtlM * 60 * 1000;
+    const stale = cleanTracks.filter(t => {
+      const entry = urlCache.get(t.videoId);
+      return !entry || (entry.expiresAt - Date.now()) < minTtlMs;
+    });
+
+    if (!stale.length) return;
+    console.log(`[warmer] refreshing ${stale.length} stale URLs...`);
+
+    for (const track of stale) {
+      await ytdlpQueue;
+      if (getCachedUrl(track.videoId)) continue;
+      try {
+        await resolveUrl(track.videoId);
+        console.log(`[warmer] warmed ${track.videoId}`);
+      } catch (err) {
+        console.warn(`[warmer] failed ${track.videoId}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.error('[warmer] error:', err.message);
+  }
+}
+
+setTimeout(() => warmUrlCache(), 60_000);
+setInterval(() => warmUrlCache(), 4 * 60 * 60 * 1000);
 
 async function runYtdlp(videoId) {
   refreshCookiesTmp(); // ensure worker reads fresh cookies
@@ -429,6 +527,7 @@ router.get('/search', async (req, res) => {
             searchMode: 'default',
             not_ideal: false,
             bugged: false,
+            durationMs: targetMs,
           },
         });
         return res.json({ videoId: validWinner.videoId, allSourcesTried: false });
@@ -459,8 +558,8 @@ router.get('/search', async (req, res) => {
   if (track_id) {
     await prisma.track.upsert({
       where: { id: track_id },
-      create: { id: track_id, videoId: winner.videoId, track, artist, ...(winner.title ? { ytTitle: winner.title } : {}), source: winner.source },
-      update: { videoId: winner.videoId, ...(winner.title ? { ytTitle: winner.title } : {}), source: winner.source },
+      create: { id: track_id, videoId: winner.videoId, track, artist, durationMs: targetMs, ...(winner.title ? { ytTitle: winner.title } : {}), source: winner.source },
+      update: { videoId: winner.videoId, durationMs: targetMs, ...(winner.title ? { ytTitle: winner.title } : {}), source: winner.source },
     });
   }
 
