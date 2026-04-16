@@ -4,8 +4,8 @@
   "type": "commonjs",
   "scripts": {
     "postinstall": "prisma generate",
-    "prestart": "prisma migrate deploy",
-    "predev": "prisma migrate deploy",
+    "prestart": "node scripts/prisma-migrate-safe.js",
+    "predev": "node scripts/prisma-migrate-safe.js",
     "start": "node server.js",
     "dev": "node --watch server.js",
     "studio": "npx prisma studio",

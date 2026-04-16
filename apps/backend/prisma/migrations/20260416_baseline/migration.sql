@@ -6,8 +6,10 @@ CREATE TABLE "Track" (
     "artist" TEXT NOT NULL,
     "ytTitle" TEXT,
     "source" TEXT NOT NULL DEFAULT 'search',
+    "not_ideal" BOOLEAN NOT NULL DEFAULT false,
     "bugged" BOOLEAN NOT NULL DEFAULT false,
     "allSourcesTried" BOOLEAN NOT NULL DEFAULT false,
+    "searchMode" TEXT NOT NULL DEFAULT 'default',
     "durationMs" INTEGER NOT NULL DEFAULT 0,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
@@ -64,4 +66,3 @@ CREATE UNIQUE INDEX "VideoBlacklist_trackId_videoId_key" ON "VideoBlacklist"("tr
 
 -- CreateIndex
 CREATE INDEX "UserEvent_createdAt_trackId_idx" ON "UserEvent"("createdAt", "trackId");
-

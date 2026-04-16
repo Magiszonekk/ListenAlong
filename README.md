@@ -71,7 +71,7 @@ If `GOOGLE_EMAIL` and `GOOGLE_PASSWORD` are set, the script logs in automaticall
 
 > The server refreshes cookies automatically every 25 minutes and on 429/403 errors via Camoufox — you only need to run this once.
 
-The database (`apps/backend/data.db`) is created automatically on first `npm start` or `npm run dev`.
+The database (`apps/backend/data.db`) is created automatically on first `npm start` or `npm run dev`. Existing local databases from before the baseline migration are recovered automatically on startup when their schema already matches the current Prisma model.
 
 ### 5. Build the frontend
 
