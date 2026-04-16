@@ -129,10 +129,8 @@ export function useSpotifySync() {
   }
   const [listenerCount, setListenerCount] = useState<number | null>(null);
   const [clientIds, setClientIds] = useState<string[]>([]);
-  const [trackNotIdeal, setTrackNotIdeal] = useState(false);
   const [trackBugged, setTrackBugged] = useState(false);
   const [trackAllSourcesTried, setTrackAllSourcesTried] = useState(false);
-  const [trackSource, setTrackSource] = useState('');
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
 
   // Audio element is managed as a mutable ref — we swap it in the DOM directly
@@ -435,20 +433,16 @@ export function useSpotifySync() {
       log(`\n--- ${data.track} – ${data.artist} ---`);
       log(`[debug] track changed: ${currentTrackIdRef.current} → ${data.track_id} (${data.track})`);
       currentTrackIdRef.current = data.track_id;
-      setTrackNotIdeal(false);
       setTrackBugged(false);
       setTrackAllSourcesTried(false);
-      setTrackSource('');
       await loadTrack(data, spotifySec);
       // queue arrives separately via 'queue' WS message → prefetchNext
       fetch(`/youtube/track/${data.track_id}`)
         .then((r) => r.ok ? r.json() : null)
         .then((t) => {
           if (t) {
-            setTrackNotIdeal(t.not_ideal);
             setTrackBugged(t.bugged);
             setTrackAllSourcesTried(t.allSourcesTried);
-            setTrackSource(t.source ?? '');
           }
         })
         .catch(() => {});
@@ -536,29 +530,14 @@ export function useSpotifySync() {
   }, []);
 
   const showFeedback = useCallback(() => {
-    setFeedbackMsg('Dziękujemy za feedback! Przy następnym razie wyszukamy innej wersji.');
+    setFeedbackMsg('Dziękujemy za feedback! Przy następnym razem wyszukamy inne źródło.');
     setTimeout(() => setFeedbackMsg(null), 5000);
   }, []);
-
-  const markNotIdeal = useCallback(() => {
-    const id = currentTrackIdRef.current;
-    if (!id) return;
-    setTrackNotIdeal(true);
-    setTrackBugged(false);
-    logEvent('not_ideal', id);
-    fetch(`/youtube/track/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ not_ideal: true }),
-    }).catch(() => {});
-    showFeedback();
-  }, [showFeedback]);
 
   const markBugged = useCallback(() => {
     const id = currentTrackIdRef.current;
     if (!id) return;
     setTrackBugged(true);
-    setTrackNotIdeal(false);
     logEvent('bug', id);
     fetch(`/youtube/track/${id}`, {
       method: 'PATCH',
@@ -634,12 +613,9 @@ export function useSpotifySync() {
     clientIds,
     audioRef,
     isListeningPaused,
-    trackNotIdeal,
     trackBugged,
     trackAllSourcesTried,
-    trackSource,
     feedbackMsg,
-    markNotIdeal,
     markBugged,
     isDev,
     forceSync,

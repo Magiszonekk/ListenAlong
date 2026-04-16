@@ -132,10 +132,22 @@ function getCachedUrl(videoId) {
   return null;
 }
 
-// Restore valid URL cache entries from DB on startup
+async function purgeExpiredUrlCache() {
+  try {
+    const { count } = await prisma.urlCache.deleteMany({ where: { expiresAt: { lt: new Date() } } });
+    if (count) console.log(`[cache] purged ${count} expired URL entries from DB`);
+  } catch (err) {
+    console.error('[cache] DB purge failed:', err.message);
+  }
+}
+
+// Restore valid URL cache entries from DB on startup, purge expired ones immediately
 (async () => {
   try {
-    const entries = await prisma.urlCache.findMany({ where: { expiresAt: { gt: new Date() } } });
+    const [entries] = await Promise.all([
+      prisma.urlCache.findMany({ where: { expiresAt: { gt: new Date() } } }),
+      purgeExpiredUrlCache(),
+    ]);
     for (const e of entries) urlCache.set(e.videoId, { url: e.url, expiresAt: e.expiresAt.getTime() });
     if (entries.length) console.log(`[cache] restored ${entries.length} URLs from DB`);
   } catch (err) {
@@ -143,18 +155,11 @@ function getCachedUrl(videoId) {
   }
 })();
 
-// Purge expired entries from DB once a day
-setInterval(async () => {
-  try {
-    const { count } = await prisma.urlCache.deleteMany({ where: { expiresAt: { lt: new Date() } } });
-    if (count) console.log(`[cache] purged ${count} expired URL entries from DB`);
-  } catch (err) {
-    console.error('[cache] DB purge failed:', err.message);
-  }
-}, 24 * 60 * 60 * 1000);
+// Purge expired entries from DB every hour (CDN URLs expire in ~6h)
+setInterval(purgeExpiredUrlCache, 60 * 60 * 1000);
 
 // Pre-warm CDN URL cache for top-N most played tracks.
-// Phase 1: proactively re-search tracks with blacklisted/stale videoIds (bugged or prefer_duration).
+// Phase 1: proactively re-search tracks with blacklisted/stale videoIds.
 // Phase 2: refresh CDN URLs for clean tracks whose TTL is running low.
 async function warmUrlCache() {
   try {
@@ -171,22 +176,22 @@ async function warmUrlCache() {
       where: { id: { in: trackIds }, allSourcesTried: false },
       select: {
         id: true, videoId: true, track: true, artist: true, durationMs: true,
-        searchMode: true, bugged: true,
+        bugged: true,
         blacklist: { select: { videoId: true } },
       },
     });
 
-    const needsResearch = tracks.filter(t => t.bugged || t.searchMode !== 'default');
-    const cleanTracks   = tracks.filter(t => !t.bugged && t.searchMode === 'default');
+    const needsResearch = tracks.filter(t => t.bugged);
+    const cleanTracks = tracks.filter(t => !t.bugged);
 
-    // --- Phase 1: proactive re-search for blacklisted / not_ideal tracks ---
+    // --- Phase 1: proactive re-search for blacklisted tracks ---
     if (needsResearch.length) {
-      console.log(`[warmer] pre-searching ${needsResearch.length} blacklisted/not_ideal tracks...`);
+      console.log(`[warmer] pre-searching ${needsResearch.length} blacklisted tracks...`);
       for (const t of needsResearch) {
         if (!t.track || !t.artist) continue;
         const blacklistedIds = new Set(t.blacklist.map(b => b.videoId));
         try {
-          const winner = await searchAllSources(t.track, t.artist, t.durationMs, t.id, blacklistedIds);
+          const winner = await searchAllSources(t.track, t.artist, t.durationMs, blacklistedIds);
           const valid = winner && !permanentlyFailed.has(winner.videoId) ? winner : null;
           if (valid) {
             console.log(`[warmer] re-search winner for ${t.id} → ${valid.videoId} (${valid.source})`);
@@ -196,8 +201,6 @@ async function warmUrlCache() {
                 videoId: valid.videoId,
                 ...(valid.title ? { ytTitle: valid.title } : {}),
                 source: valid.source,
-                searchMode: 'default',
-                not_ideal: false,
                 bugged: false,
               },
             });
@@ -213,7 +216,7 @@ async function warmUrlCache() {
             console.log(`[warmer] re-search no winner for ${t.id} — marking allSourcesTried`);
             await prisma.track.update({
               where: { id: t.id },
-              data: { allSourcesTried: true, searchMode: 'default', not_ideal: false, bugged: false },
+              data: { allSourcesTried: true, bugged: false },
             });
           }
         } catch (err) {
@@ -340,7 +343,7 @@ function autoBlacklist(videoId) {
         }),
         prisma.track.update({
           where: { id: track.id },
-          data: { bugged: true, allSourcesTried: false, searchMode: 'default' },
+          data: { bugged: true, allSourcesTried: false },
         }),
       ]);
     })
@@ -401,30 +404,9 @@ function resolveUrl(videoId, priority = PRIO.DIRECT) {
   return promise;
 }
 
-async function odesliLookup(trackId) {
-  try {
-    const url = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(`https://open.spotify.com/track/${trackId}`)}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const platforms = data.linksByPlatform ?? {};
-    for (const key of ['youtubeMusic', 'youtube']) {
-      const link = platforms[key]?.url;
-      if (link) {
-        const videoId = new URL(link).searchParams.get('v');
-        if (videoId) return videoId;
-      }
-    }
-    return null;
-  } catch (_) {
-    return null;
-  }
-}
-
 // --- Routes ---
 
 const NOISE_RE = /\b(instrumental|karaoke|off[\s-]?vocal|backing[\s-]?track|inst\.?|nightcore|nighcore|cover|ai\s+cover|slowed|reverb|sped[\s-]?up|speed[\s-]?up|(?:english|spanish|french|portuguese|german|italian|dutch|korean|chinese)\s+(?:ver(?:sion)?\.?|dub)|translat(?:ion|ed))\b|[\[(（](?:inst|english)[\]）)]|インスト|カラオケ|オフボーカル|\bMR\b/i;
-const ODESLI_BONUS_MS = searchConfig.odesliBonus;
 
 async function searchYouTube(track, artist) {
   return new Promise((resolve) => {
@@ -477,14 +459,12 @@ function scriptBonus(title, track, artist) {
   return CJK_RE.test(title ?? '') ? SCRIPT_BONUS_MS : 0;
 }
 
-async function searchAllSources(track, artist, targetMs, trackId, blacklistedIds = new Set()) {
-  const [odesliResult, ytMusicResult, ytSearchResult] = await Promise.allSettled([
-    trackId ? odesliLookup(trackId) : Promise.resolve(null),
+async function searchAllSources(track, artist, targetMs, blacklistedIds = new Set()) {
+  const [ytMusicResult, ytSearchResult] = await Promise.allSettled([
     ytmusicReady.then(() => ytmusic.searchSongs(`${track} ${artist}`)).catch(() => []),
     searchYouTube(track, artist),
   ]);
 
-  const odesliId = odesliResult.status === 'fulfilled' ? odesliResult.value : null;
   if (ytMusicResult.status === 'rejected') console.warn(`[search] ytmusic failed: ${ytMusicResult.reason}`);
   if (ytSearchResult.status === 'rejected') console.warn(`[search] ytsearch failed: ${ytSearchResult.reason}`);
 
@@ -493,16 +473,14 @@ async function searchAllSources(track, artist, targetMs, trackId, blacklistedIds
 
   function addCandidate(videoId, durationMs, title, source) {
     if (!videoId || blacklistedIds.has(videoId) || NOISE_RE.test(title ?? '')) return;
-    const isOdesli = videoId === odesliId;
     const deltaMs = Math.abs(durationMs - targetMs);
-    const effectiveSource = isOdesli ? `odesli+${source}` : source;
     if (seen.has(videoId)) {
       const ex = candidates.find((c) => c.videoId === videoId);
       if (ex && !ex.source.includes(source)) ex.source += `+${source}`;
       return;
     }
     seen.add(videoId);
-    candidates.push({ videoId, title, deltaMs, source: effectiveSource });
+    candidates.push({ videoId, title, deltaMs, source });
   }
 
   for (const s of (ytMusicResult.status === 'fulfilled' ? (ytMusicResult.value ?? []) : [])) {
@@ -512,22 +490,14 @@ async function searchAllSources(track, artist, targetMs, trackId, blacklistedIds
     addCandidate(s.videoId, s.durationMs, s.title, 'ytsearch');
   }
 
-  // Pure Odesli — not found in any search result, trust it with neutral score
-  if (odesliId && !blacklistedIds.has(odesliId) && !seen.has(odesliId)) {
-    candidates.push({ videoId: odesliId, title: null, deltaMs: ODESLI_BONUS_MS, source: 'odesli' });
-  }
-
   if (!candidates.length) return null;
 
-  // Score: lower = better
-  // Odesli gets ODESLI_BONUS_MS advantage; title relevance gives up to TITLE_BONUS_MS advantage
+  // Score: lower = better. Title relevance and script match reduce effective distance.
   candidates.sort((a, b) => {
     const sa = a.deltaMs
-      - (a.source.includes('odesli') ? ODESLI_BONUS_MS : 0)
       - titleRelevance(a.title, track, artist) * TITLE_BONUS_MS
       - scriptBonus(a.title, track, artist);
     const sb = b.deltaMs
-      - (b.source.includes('odesli') ? ODESLI_BONUS_MS : 0)
       - titleRelevance(b.title, track, artist) * TITLE_BONUS_MS
       - scriptBonus(b.title, track, artist);
     return sa - sb;
@@ -565,8 +535,8 @@ router.get('/search', async (req, res) => {
         String(req.query.blacklist).split(',').forEach((id) => blacklistedIds.add(id));
       }
 
-      // Cache hit — not blacklisted, not permanently failed, and no re-search pending
-      if (!blacklistedIds.has(cached.videoId) && !permanentlyFailed.has(cached.videoId) && cached.searchMode !== 'prefer_duration') {
+      // Cache hit — not blacklisted and not permanently failed.
+      if (!blacklistedIds.has(cached.videoId) && !permanentlyFailed.has(cached.videoId)) {
         console.log(`[search] cache hit for ${track_id}`);
         if (!getCachedUrl(cached.videoId)) resolveUrl(cached.videoId, PRIO.PREFETCH).catch(() => {});
         // Backfill missing metadata in background
@@ -594,11 +564,9 @@ router.get('/search', async (req, res) => {
         return res.json({ videoId: cached.videoId, allSourcesTried: false });
       }
 
-      // Re-search: blacklisted videoId or prefer_duration mode
-      const reason = cached.searchMode === 'prefer_duration' ? 'prefer_duration' : 'blacklisted';
-      console.log(`[search] re-search for ${track_id} (reason=${reason})`);
+      console.log(`[search] re-search for ${track_id} (reason=blacklisted)`);
 
-      const winner = await searchAllSources(track, artist, targetMs, track_id, blacklistedIds);
+      const winner = await searchAllSources(track, artist, targetMs, blacklistedIds);
       // Belt-and-suspenders: reject winner if it became permanently failed while search was in flight
       const validWinner = winner && !permanentlyFailed.has(winner.videoId) ? winner : null;
       if (validWinner) {
@@ -610,8 +578,6 @@ router.get('/search', async (req, res) => {
             videoId: validWinner.videoId,
             ...(validWinner.title ? { ytTitle: validWinner.title } : {}),
             source: validWinner.source,
-            searchMode: 'default',
-            not_ideal: false,
             bugged: false,
             durationMs: targetMs,
           },
@@ -622,7 +588,7 @@ router.get('/search', async (req, res) => {
       console.log(`[search] all sources exhausted for ${track_id}`);
       await prisma.track.update({
         where: { id: track_id },
-        data: { allSourcesTried: true, searchMode: 'default', not_ideal: false, bugged: false },
+        data: { allSourcesTried: true, bugged: false },
       });
       return res.json({ videoId: cached.videoId, allSourcesTried: true });
     }
@@ -633,7 +599,7 @@ router.get('/search', async (req, res) => {
   if (req.query.blacklist) {
     String(req.query.blacklist).split(',').forEach((id) => blacklistedIds.add(id));
   }
-  const winner = await searchAllSources(track, artist, targetMs, track_id ?? null, blacklistedIds);
+  const winner = await searchAllSources(track, artist, targetMs, blacklistedIds);
   if (!winner) {
     return res.json({ videoId: null, allSourcesTried: false });
   }
@@ -659,32 +625,26 @@ router.get('/track/:id', async (req, res) => {
   res.json(track);
 });
 
-// PATCH /youtube/track/:id — blacklistuje videoId i ustawia tryb re-searchu
+// PATCH /youtube/track/:id — blacklist current videoId and trigger a fresh search
 router.patch('/track/:id', async (req, res) => {
-  const { not_ideal, bugged } = req.body;
-  if (!not_ideal && !bugged) return res.status(400).json({ error: 'not_ideal or bugged required' });
-
-  const reason = not_ideal ? 'not_ideal' : 'bugged';
+  const { bugged } = req.body;
+  if (!bugged) return res.status(400).json({ error: 'bugged required' });
 
   try {
     const track = await prisma.track.findUnique({ where: { id: req.params.id } });
     if (!track) return res.status(404).json({ error: 'track not found' });
 
-    if (reason === 'bugged') {
-      await prisma.videoBlacklist.upsert({
-        where: { trackId_videoId: { trackId: req.params.id, videoId: track.videoId } },
-        create: { trackId: req.params.id, videoId: track.videoId, reason },
-        update: { reason },
-      });
-    }
+    await prisma.videoBlacklist.upsert({
+      where: { trackId_videoId: { trackId: req.params.id, videoId: track.videoId } },
+      create: { trackId: req.params.id, videoId: track.videoId, reason: 'bugged' },
+      update: { reason: 'bugged' },
+    });
 
     await prisma.track.update({
       where: { id: req.params.id },
       data: {
-        not_ideal: reason === 'not_ideal',
-        bugged: reason === 'bugged',
+        bugged: true,
         allSourcesTried: false,
-        searchMode: reason === 'not_ideal' ? 'prefer_duration' : 'default',
       },
     });
 

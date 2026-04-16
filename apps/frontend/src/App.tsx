@@ -18,12 +18,9 @@ export default function App() {
     listenerCount,
     clientIds,
     audioRef,
-    trackNotIdeal,
     trackBugged,
     trackAllSourcesTried,
-    trackSource,
     feedbackMsg,
-    markNotIdeal,
     markBugged,
     isDev,
     forceSync,
@@ -113,19 +110,6 @@ export default function App() {
       {started && (
         <div className="flex flex-col items-center gap-3">
           <div className="flex items-center gap-3">
-            {trackSource === 'odesli' && (
-              <Button
-                onClick={markNotIdeal}
-                disabled={trackNotIdeal || trackAllSourcesTried}
-                title={trackAllSourcesTried ? 'Sprawdzono wszystkie źródła' : 'Zgłoś niedopasowanie (znajdziemy wersję o lepszym czasie)'}
-                className={trackNotIdeal
-                  ? "bg-yellow-600 text-white rounded-full w-11 h-11 text-base font-bold p-0 opacity-60 cursor-not-allowed"
-                  : "bg-neutral-800 text-neutral-400 hover:bg-yellow-600 hover:text-white rounded-full w-11 h-11 text-base font-bold p-0 disabled:opacity-40 disabled:cursor-not-allowed"
-                }
-              >
-                ~
-              </Button>
-            )}
             <Button
               onClick={markBugged}
               disabled={trackBugged || trackAllSourcesTried}

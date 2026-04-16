@@ -7,7 +7,7 @@ Streams audio synced to whatever is currently playing on Spotify — finds the m
 1. The host authenticates with Spotify via OAuth.
 2. The backend polls Spotify every second for the currently playing track and progress.
 3. State is broadcast to all connected clients over WebSocket.
-4. When a new track starts, the backend resolves a YouTube audio URL (via Odesli mapping and/or YTMusic search + yt-dlp) and caches it.
+4. When a new track starts, the backend resolves a YouTube audio URL (via YTMusic search + yt-dlp) and caches it.
 5. Upcoming tracks are prefetched in the background so the transition is seamless:
    - **N+1** — CDN URL resolved + audio buffered in the browser.
    - **N+2 … N+`PREFETCH_AHEAD`** — CDN URL resolved only (no audio element).
@@ -124,10 +124,9 @@ These appear after clicking Start sync:
 
 | Button | What it does |
 |---|---|
-| `~` | Flags the current match as imprecise — on next play the search prefers a version with a closer duration |
 | Bug icon | Blacklists the current YouTube video — on next play an entirely different source is found |
 
-If all alternative sources have been tried, both buttons are disabled and a notice is shown.
+If all alternative sources have been tried, the button is disabled and a notice is shown.
 
 ---
 
@@ -140,7 +139,6 @@ All variables are optional — defaults are shown. Set them in `.env`.
 | Variable | Default | Description |
 |---|---|---|
 | `YT_SEARCH_COUNT` | `5` | Number of YouTube candidates to fetch and score |
-| `ODESLI_BONUS_MS` | `0` | Score bonus (ms) for Odesli-matched candidates |
 | `TITLE_BONUS_MS` | `15000` | Max score bonus for title/artist word overlap |
 | `SCRIPT_BONUS_MS` | `10000` | Score bonus when track has CJK characters and the YouTube title also does |
 
@@ -181,7 +179,7 @@ npm run studio
 | `UrlCache` | Resolved YouTube CDN URLs with expiry timestamps |
 | `Play` | Per-client play history |
 | `AuthEvent` | Spotify OAuth login events (IP, user agent) |
-| `UserEvent` | Client-side events: `start`, `pause`, `resume`, `spotify_pause`, `spotify_play`, `bug`, `not_ideal`, `exit` |
+| `UserEvent` | Client-side events: `start`, `pause`, `resume`, `spotify_pause`, `spotify_play`, `bug`, `exit` |
 
 ### Cleanup
 

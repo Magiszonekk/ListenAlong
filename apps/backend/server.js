@@ -74,7 +74,7 @@ app.post('/log', (req, res) => {
   res.end();
 });
 
-// POST /events — frontend event log (start, pause, resume, spotify_pause, spotify_play, bug, not_ideal, exit)
+// POST /events — frontend event log (start, pause, resume, spotify_pause, spotify_play, bug, exit)
 app.post('/events', async (req, res) => {
   const clientId = req.headers['x-client-id'] || req.body.clientId;
   const { action, trackId } = req.body;
@@ -226,6 +226,13 @@ async function spotifyPollTick() {
 
       if (state.track_id && state.track_id !== lastTrackId) {
         lastTrackId = state.track_id;
+
+        // Record play for every connected listener
+        const trackId = state.track_id;
+        for (const clientId of wsClients.keys()) {
+          prisma.play.create({ data: { trackId, clientId } }).catch(() => {});
+        }
+
         const next = await fetchQueue();
         lastQueue = next;
         broadcastAll(queueMsg(next));

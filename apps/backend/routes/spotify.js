@@ -5,8 +5,6 @@ const { prisma } = require('../lib/db');
 
 const router = express.Router();
 
-const lastTrackPerClient = new Map(); // clientId → track_id
-
 // GET /spotify/now-playing
 router.get('/now-playing', async (req, res) => {
   const token = await getAccessToken();
@@ -26,16 +24,6 @@ router.get('/now-playing', async (req, res) => {
   }
 
   const { item, progress_ms, is_playing } = response.data;
-
-  if (is_playing) {
-    const clientId = req.headers['x-client-id'];
-    if (clientId && lastTrackPerClient.get(clientId) !== item.id) {
-      lastTrackPerClient.set(clientId, item.id);
-      prisma.play.create({
-        data: { trackId: item.id, clientId },
-      }).catch(() => {});
-    }
-  }
 
   res.json({
     track: item.name,

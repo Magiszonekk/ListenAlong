@@ -3,7 +3,6 @@
 //
 // Usage:
 //   node scripts/test_search.js --track "Song Name" --artist "Artist" --duration_ms 210000
-//   node scripts/test_search.js --track "Song Name" --artist "Artist" --duration_ms 210000 --track_id abc123
 //
 // Does NOT touch the database or cache — purely diagnostic.
 
@@ -13,7 +12,6 @@ const YTMusic = require('ytmusic-api');
 const { search: searchConfig } = require('@listenalong/config');
 
 const NOISE_RE = /\b(instrumental|karaoke|off[\s-]?vocal|backing[\s-]?track|inst\.?|nightcore|nighcore|cover|ai\s+cover|slowed|reverb|sped[\s-]?up|speed[\s-]?up|(?:english|spanish|french|portuguese|german|italian|dutch|korean|chinese)\s+(?:ver(?:sion)?\.?|dub)|translat(?:ion|ed))\b|[\[(（](?:inst|english)[\]）)]|インスト|カラオケ|オフボーカル|\bMR\b/i;
-const ODESLI_BONUS_MS = searchConfig.odesliBonus;
 
 const YT_DLP = process.env.YT_DLP_PATH || '/usr/local/bin/yt-dlp';
 const COOKIES_TMP = path.join(__dirname, '..', 'cookies_tmp.txt');
@@ -30,10 +28,9 @@ function getArg(name) {
 const track     = getArg('track');
 const artist    = getArg('artist');
 const durationS = getArg('duration_ms');
-const trackId   = getArg('track_id');
 
 if (!track || !artist || !durationS) {
-  console.error('Usage: node scripts/test_search.js --track "Name" --artist "Artist" --duration_ms 210000 [--track_id id]');
+  console.error('Usage: node scripts/test_search.js --track "Name" --artist "Artist" --duration_ms 210000');
   process.exit(1);
 }
 
@@ -55,22 +52,24 @@ function fmtDuration(sec) {
 const pad  = (s, n) => String(s ?? '').slice(0, n).padEnd(n);
 const lpad = (s, n) => String(s ?? '').slice(0, n).padStart(n);
 
-async function odesliLookup(id) {
-  try {
-    const url = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(`https://open.spotify.com/track/${id}`)}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const platforms = data.linksByPlatform ?? {};
-    for (const key of ['youtubeMusic', 'youtube']) {
-      const link = platforms[key]?.url;
-      if (link) {
-        const videoId = new URL(link).searchParams.get('v');
-        if (videoId) return videoId;
-      }
-    }
-    return null;
-  } catch (_) { return null; }
+function titleRelevance(title, trackName, artistName) {
+  if (!title) return 0;
+  const lowerTitle = title.toLowerCase();
+  const words = `${trackName} ${artistName}`.toLowerCase()
+    .replace(/_/g, ' ')
+    .split(/[\s,\-–()/]+/)
+    .filter((word) => word.length > 3);
+  if (!words.length) return 0;
+  return words.filter((word) => lowerTitle.includes(word)).length / words.length;
+}
+
+const TITLE_BONUS_MS = searchConfig.titleBonus;
+const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
+const SCRIPT_BONUS_MS = searchConfig.scriptBonus;
+
+function scriptBonus(title, trackName, artistName) {
+  if (!CJK_RE.test(trackName) && !CJK_RE.test(artistName)) return 0;
+  return CJK_RE.test(title ?? '') ? SCRIPT_BONUS_MS : 0;
 }
 
 function searchYouTube(t, a) {
@@ -97,7 +96,7 @@ function searchYouTube(t, a) {
   });
 }
 
-function printTable(rows, odesliId) {
+function printTable(rows) {
   const COL = { rank: 4, title: 48, id: 13, dur: 7, delta: 8 };
   const hr = '-'.repeat(COL.rank + COL.title + COL.id + COL.dur + COL.delta + 20);
   console.log(
@@ -108,8 +107,7 @@ function printTable(rows, odesliId) {
   console.log(hr);
   rows.forEach((r, i) => {
     const isNoise   = NOISE_RE.test(r.title ?? '');
-    const isOdesli  = r.videoId === odesliId;
-    const flags = [isNoise ? 'NOISE' : '', isOdesli ? 'ODESLI' : ''].filter(Boolean).join(' ');
+    const flags = [isNoise ? 'NOISE' : ''].filter(Boolean).join(' ');
     const durStr   = r.durationMs ? fmtDuration(r.durationMs / 1000) : '?';
     const deltaStr = r.durationMs ? fmtDelta(r.durationMs - targetMs) : '?';
     console.log(
@@ -127,32 +125,20 @@ async function main() {
   console.log(`Track    : ${track}`);
   console.log(`Artist   : ${artist}`);
   console.log(`Target   : ${fmtDuration(targetMs / 1000)}  [${targetMs} ms]`);
-  if (trackId) console.log(`Track ID : ${trackId}`);
   console.log('');
 
   const ytmusic = new YTMusic();
 
-  // Run all three in parallel (same as production)
-  process.stdout.write('Running Odesli + YTMusic + YouTube in parallel... ');
-  const [odesliResult, ytMusicResult, ytSearchResult] = await Promise.allSettled([
-    trackId ? odesliLookup(trackId) : Promise.resolve(null),
+  // Run both production search sources in parallel.
+  process.stdout.write('Running YTMusic + YouTube in parallel... ');
+  const [ytMusicResult, ytSearchResult] = await Promise.allSettled([
     ytmusic.initialize().then(() => ytmusic.searchSongs(`${track} ${artist}`)).catch(() => []),
     searchYouTube(track, artist),
   ]);
   console.log('done\n');
 
-  const odesliId = odesliResult.status === 'fulfilled' ? odesliResult.value : null;
   const ytMusicSongs = ytMusicResult.status === 'fulfilled' ? (ytMusicResult.value ?? []) : [];
   const ytSearchSongs = ytSearchResult.status === 'fulfilled' ? (ytSearchResult.value ?? []) : [];
-
-  // --- Odesli ---
-  console.log(`=== Odesli ===`);
-  if (odesliId) {
-    console.log(`HIT → ${odesliId}  https://www.youtube.com/watch?v=${odesliId}`);
-  } else {
-    console.log(`miss${odesliResult.status === 'rejected' ? ` (error: ${odesliResult.reason})` : ''}`);
-  }
-  console.log('');
 
   // --- YTMusic ---
   console.log(`=== YTMusic (${ytMusicSongs.length} results) ===`);
@@ -161,7 +147,7 @@ async function main() {
     const rows = [...ytMusicSongs]
       .sort((a, b) => Math.abs((a.duration ?? 0) * 1000 - targetMs) - Math.abs((b.duration ?? 0) * 1000 - targetMs))
       .map((s) => ({ videoId: s.videoId, title: s.name, durationMs: (s.duration ?? 0) * 1000 }));
-    printTable(rows, odesliId);
+    printTable(rows);
   }
   console.log('');
 
@@ -170,7 +156,7 @@ async function main() {
   if (ytSearchResult.status === 'rejected') console.log(`ERROR: ${ytSearchResult.reason}`);
   if (ytSearchSongs.length) {
     const rows = [...ytSearchSongs].sort((a, b) => Math.abs(a.durationMs - targetMs) - Math.abs(b.durationMs - targetMs));
-    printTable(rows, odesliId);
+    printTable(rows);
   }
   console.log('');
 
@@ -181,16 +167,14 @@ async function main() {
 
   function addCandidate(videoId, durationMs, title, source) {
     if (!videoId || NOISE_RE.test(title ?? '')) return;
-    const isOdesli = videoId === odesliId;
     const deltaMs = Math.abs(durationMs - targetMs);
-    const effectiveSource = isOdesli ? `odesli+${source}` : source;
     if (seen.has(videoId)) {
       const ex = candidates.find((c) => c.videoId === videoId);
       if (ex && !ex.source.includes(source)) ex.source += `+${source}`;
       return;
     }
     seen.add(videoId);
-    candidates.push({ videoId, title, deltaMs, source: effectiveSource });
+    candidates.push({ videoId, title, deltaMs, source });
   }
 
   for (const s of ytMusicSongs) {
@@ -199,16 +183,17 @@ async function main() {
   for (const s of ytSearchSongs) {
     addCandidate(s.videoId, s.durationMs, s.title, 'ytsearch');
   }
-  if (odesliId && !seen.has(odesliId)) {
-    candidates.push({ videoId: odesliId, title: null, deltaMs: ODESLI_BONUS_MS, source: 'odesli' });
-  }
 
   if (!candidates.length) {
     console.log('NO CANDIDATES — nothing would be found');
   } else {
     candidates.sort((a, b) => {
-      const sa = a.source.includes('odesli') ? Math.max(0, a.deltaMs - ODESLI_BONUS_MS) : a.deltaMs;
-      const sb = b.source.includes('odesli') ? Math.max(0, b.deltaMs - ODESLI_BONUS_MS) : b.deltaMs;
+      const sa = a.deltaMs
+        - titleRelevance(a.title, track, artist) * TITLE_BONUS_MS
+        - scriptBonus(a.title, track, artist);
+      const sb = b.deltaMs
+        - titleRelevance(b.title, track, artist) * TITLE_BONUS_MS
+        - scriptBonus(b.title, track, artist);
       return sa - sb;
     });
     const w = candidates[0];

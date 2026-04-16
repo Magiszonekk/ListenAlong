@@ -7,8 +7,6 @@ module.exports = {
   search: {
     // Ile wyników pobierać z YouTube search (ytsearch<N>:)
     ytSearchCount: envNum('YT_SEARCH_COUNT', 5),
-    // Ms przewagi dla kandydata znalezionego przez Odesli (bezpośrednie mapowanie Spotify→YT)
-    odesliBonus: envNum('ODESLI_BONUS_MS', 0),
     // Max ms przewagi za zgodność słów tytułu z track+artist (0..1 × titleBonus)
     titleBonus: envNum('TITLE_BONUS_MS', 15_000),
     // Ms przewagi gdy track/artysta ma znaki CJK i tytuł kandydata też je zawiera
